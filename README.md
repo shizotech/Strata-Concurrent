@@ -1,4 +1,4 @@
-<h1 align="center">Strata</h1>
+<h1 align="center">Strata-Concordia</h1>
 
 <p align="center"><b>Run a 125-billion-parameter AI model on a normal gaming PC</b><br>
 one NVIDIA card (12-24 GB) + 64 GB of RAM · Windows or Linux · one click to install</p>
@@ -7,9 +7,13 @@ one NVIDIA card (12-24 GB) + 64 GB of RAM · Windows or Linux · one click to in
 <sub>A voxel pagoda garden, 1 shot prompt running on an RTX 5070 with Strata (IQ3_S, 128K context) ·
 <a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4">full video (49 s)</a></sub></p>
 
-Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** - a large, smart AI model that
-normally needs a server - on your own PC. It writes its answers at **60-95 tokens per second** (a token is about ¾
-of a word): faster than you can read.
+Strata-Concordia runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** - a large, smart AI
+model that normally needs a server - on your own PC. It writes its answers at **60-95 tokens per second** (a token is
+about ¾ of a word): faster than you can read.
+
+*Concordia*: it runs several conversations at once and they don't fight over the model. A fork of
+[Strata](https://github.com/Niko1221/Strata) - same engine, same answers, and everything new here is opt-in.
+(Commands, files and folders are still named `strata` / `Strata` - only the project has a new name.)
 
 - **Free and open source.**
 
@@ -240,9 +244,8 @@ naming both numbers - instead of discovering it halfway through an answer. Raise
 
 ## What's different here
 
-This is a fork of [Strata](https://github.com/Niko1221/Strata) focused on **concurrency**: running several
-conversations at once without them destroying each other's speed. Everything upstream still works the same way, and
-the changes are opt-in.
+Concordia: running several conversations at once without them destroying each other's speed. Everything upstream
+still works the same way, and the changes are opt-in.
 
 - **Serve several conversations at the same time** (`--serve-slots N`), with each conversation keeping its own
   position, cache and memory budget.
@@ -333,7 +336,8 @@ Want the full picture? The [details](docs/DETAILS.md#how-it-works) explain every
 
 ## License
 
-Strata is open source under the [MIT License](LICENSE). A few parts carry their own licenses: `third_party/ggml`
+Strata-Concordia is open source under the [MIT License](LICENSE). A few parts carry their own licenses:
+`third_party/ggml`
 (MIT, llama.cpp / ggml), the web app's font (SIL Open Font License 1.1) and the experimental speed projection's
 vector in `data/experimental-speed-projection` (Qwen Community License 1.0, from the model's activations). The
 models are not part of this repository; each model's own license applies to its files.
