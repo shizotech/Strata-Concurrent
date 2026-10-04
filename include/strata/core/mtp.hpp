@@ -22,6 +22,7 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/verify_kernels.hpp"   // S4.5-D: kVerifyShapeSlots for the six graph arrays
 
 #include <cuda_runtime.h>
 
@@ -138,12 +139,12 @@ private:
     /// KV-only mode: refuse a draft round instead of running it - 0 candidates, `drafts`/`probs` zeroed.
     /// `draft` and `draft_first` share it so the two entry points cannot drift apart.
     bool refuse_draft(int T, int32_t* drafts, float* probs, int* n_drafts, std::string& err);
-    cudaGraphExec_t step_exec_[9] = {};
+    cudaGraphExec_t step_exec_[strata::kernels::kVerifyShapeSlots] = {};   // indexed by the chain step j <= max_t-2
     // coupled draft sampling: its own round/step graphs (the argmax ones stay as they were), the request's
     // parameters and the penalty ring (mapped staging + device copies), the split scratch, token id -> subset index
     bool setup_coupled(std::string& err);
-    cudaGraphExec_t round_exec_c_[9] = {};
-    cudaGraphExec_t step_exec_c_[9] = {};
+    cudaGraphExec_t round_exec_c_[strata::kernels::kVerifyShapeSlots] = {};
+    cudaGraphExec_t step_exec_c_[strata::kernels::kVerifyShapeSlots] = {};
     bool coupled_ok_ = false, coupled_active_ = false;
     bool coupled_rec_ = false;   ///< record_forward: the full layer ends in the coupled sampler (draft coupled_j_)
     // S4.3.4: the KV-only mode (bind_kv_only) and its bookkeeping
@@ -169,11 +170,30 @@ private:
     int64_t n_vocab_ = 0;
     uint64_t vram_ = 0;
     cudaStream_t cs_ = nullptr;
-    cudaGraphExec_t prefill_exec_[9] = {};
-    cudaGraphExec_t prefill_dev_exec_[9] = {};
+    cudaGraphExec_t prefill_exec_[strata::kernels::kVerifyShapeSlots] = {};
+    cudaGraphExec_t prefill_dev_exec_[strata::kernels::kVerifyShapeSlots] = {};
     int32_t* pf_dev_ = nullptr;   ///< E-4: a prompt's rows' token / step / position records, uploaded at once
     int64_t pf_cap_ = 0;          ///< its capacity in ints
-    cudaGraphExec_t round_exec_[9] = {};
+    cudaGraphExec_t round_exec_[strata::kernels::kVerifyShapeSlots] = {};
+
+    // S4.5-D: every one of the six graph arrays above is indexed by a window/draft shape
+    // `T` (round/prefill) or a chain step `j <= max_t_ - 2` (step), and `capture_round` /
+    // `capture_step` / `capture_prefill` write them with no bounds check
+    // (src/core/mtp.cpp:711, 722, 730, 765).  They were a literal `[9]` with no textual
+    // link to kVerifyMaxT; now they are kVerifyMaxT + 1 and this assert makes the link
+    // compile-time.  The value is unchanged (9), so the compiled code is unchanged.
+    static_assert(sizeof(prefill_exec_) / sizeof(prefill_exec_[0]) > strata::kernels::kVerifyMaxT,
+                  "prefill_exec_[T] is indexed up to kVerifyMaxT (mtp.cpp:711)");
+    static_assert(sizeof(prefill_dev_exec_) / sizeof(prefill_dev_exec_[0]) > strata::kernels::kVerifyMaxT,
+                  "prefill_dev_exec_[T] is indexed up to kVerifyMaxT (mtp.cpp:722)");
+    static_assert(sizeof(round_exec_) / sizeof(round_exec_[0]) > strata::kernels::kVerifyMaxT,
+                  "round_exec_[T] is indexed up to kVerifyMaxT (mtp.cpp:730)");
+    static_assert(sizeof(round_exec_c_) / sizeof(round_exec_c_[0]) > strata::kernels::kVerifyMaxT,
+                  "round_exec_c_[T] is indexed up to kVerifyMaxT (mtp.cpp:730)");
+    static_assert(sizeof(step_exec_) / sizeof(step_exec_[0]) > strata::kernels::kVerifyMaxT,
+                  "step_exec_[j] is indexed by a chain step (mtp.cpp:765)");
+    static_assert(sizeof(step_exec_c_) / sizeof(step_exec_c_[0]) > strata::kernels::kVerifyMaxT,
+                  "step_exec_c_[j] is indexed by a chain step (mtp.cpp:765)");
 
     struct Tensor { std::string name, kind; int64_t rows = 0, cols = 0; uint64_t off = 0, bytes = 0; };
     std::vector<Tensor> tensors_;

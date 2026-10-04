@@ -942,4 +942,19 @@ if(STRATA_BUILD_TESTS AND TARGET strata_engine)
     add_test(NAME prefill_svc_test COMMAND prefill_svc_test)
     set_tests_properties(prefill_svc_test PROPERTIES TIMEOUT 120)
   endif()
+
+  # S4.5-D — the window-shape arrays follow kVerifyMaxT.  CPU-only (no CUDA call, no device), but it
+  # includes verify.hpp and mtp.hpp, which need the CUDA runtime headers, so it lives in the CUDA
+  # branch.  It guards the rename of the seven literal `[9]` shape arrays to kVerifyShapeSlots: the
+  # array lengths themselves are pinned by static_assert at the point of declaration in the two
+  # headers, and this checks the two things a header assert cannot - that the constants still have
+  # the values the T <= 8 path was measured with, and that the struct sizes did not move (Verifier
+  # and MtpDrafter are constructed on the stack, so a size change is a real ABI change).
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/core/verify_shape_slots_test.cpp")
+    add_executable(verify_shape_slots_test src/core/verify_shape_slots_test.cpp)
+    target_include_directories(verify_shape_slots_test PRIVATE include)
+    target_link_libraries(verify_shape_slots_test PRIVATE strata_engine)
+    add_test(NAME verify_shape_slots_test COMMAND verify_shape_slots_test)
+    set_tests_properties(verify_shape_slots_test PROPERTIES TIMEOUT 120)
+  endif()
 endif()

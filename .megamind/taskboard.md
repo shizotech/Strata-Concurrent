@@ -665,6 +665,41 @@ Plus: **hold, don't reject** — a request with no resources waits instead of er
   Two owner decisions gate it: may the expert cache shrink (~130 slots for B=2), and is +6.19 GiB
   pinned RAM per extra sequence acceptable?
 
+## S4.6 the marginal-row slope, MEASURED  ✅ DONE (offline) / 🔄 owner run pending
+Owner challenged S4.1's "+11-13 % for B=2". It was measured instead of interpolated, and the answer
+reframes the whole batching decision.
+- [x] `bench/decode-slope/analyze.py` (2022 lines) — parses the live log, derives per-window rows from
+      the identity `ΣT = drafts_offered + windows`, keeps only requests where `generated == accepted +
+      windows` exactly, fits `a + b_gpu*hits + b_cpu*misses` with bootstrap CIs. **Read-only, no engine.**
+- [x] `bench/decode-slope/selftest.py` — recovers a planted ground truth (`a=12.00, b_gpu=5.60,
+      b_cpu=37.70/miss-row`), so the decomposition is not an artifact of the derivation.
+- [x] `bench/decode-slope/slope-ab.sh` (418 lines, `bash -n` clean) — the owner's A/B ladder. Refuses to
+      act without `--run`; **never executed here** (starting an engine is forbidden).
+- [x] `bench/decode-slope/README.md` — owner-facing: what is safe to run, what each arm proves.
+- [x] `docs/STAGE4-BATCH-DECODE.md` **§9** appended (supersedes §3.5 and §4.2's headline) + the priced
+      ceilings table. Notes: `.megamind/src/kernels/s45-decode-slope-notes.md`,
+      `.megamind/src/kernels/s45-ceilings-table.md`.
+
+**THE CORRECTED COST MODEL (fitted, not interpolated):**
+```
+a     = 12.4 ms fixed/window
+b_gpu = -0.016 ms/row   ~0: a VRAM-resident expert row is FREE at this resolution
+b_cpu = +0.0601 ms per CPU-pool expert entry  CI [+0.0575,+0.0628]  (median 205/window = 12.3 ms)
+b     = 10.89 ms/row at 86.4% hit   |   5.19 ms/row at 100% hit (REACHABLE)   |   0.74 floor (HBM)
+```
+**The row cost is the CPU expert pool, not GPU arithmetic and not launch overhead.** So the lever that
+flattens the slope is **VRAM for the expert cache**, not a kernel rewrite. B=8 at full cache = **+49 %**,
+B=16 = **+54 %** (vs +24 % / +26 % measured today). S4.1's +11-13 % was right for this box as configured
+and wrong as a ceiling.
+**Also corrected:** §1.2's "six 8-row ceilings" is **thirteen** — seven more hard limits were found,
+three silent (`kFusedGrMaxT`, the `n_tok > 8` guards in `native_bf16.cu:139` / `shared_expert.cu:172`,
+`kMaxWindowEntries=128` with `static_assert(cpu::MAXT*10 <= 128)`, `CAP`, `groups_[9]`, `last_tokens_[8]`).
+`GMAX` at 24 does not cost memory, it **stops the build** (`ptxas: 0x10e00 > 0xc000`, measured with
+`nvcc -Xptxas -v`). Raising one and missing the rest is risk **B1**.
+- [ ] **Owner action:** stop the servers, then `bench/decode-slope/slope-ab.sh --run`. The decisive arm
+      is `cache3k` (raises the miss rate at fixed `T`): if `b` rises with the miss rate and not with
+      `T`, the slope is confirmed to be the CPU pool and the fix is VRAM, not kernels.
+
 ## Sequencing
 ```
 S4.0 (design)  ∥  S4.1 (batch feasibility)  ∥  S4.2 (wait queue)

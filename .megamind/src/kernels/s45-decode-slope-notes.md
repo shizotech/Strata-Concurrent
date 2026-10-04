@@ -69,3 +69,76 @@ honest way to get a clean slope from this log.
   ⇒ slope `(50.8 − 24) / (3.99 − 1)` = **6.7 ms/row**, and the intercept moves. **S4.1 §3.5's "T=6 ⇒
   66 ms" is wrong**: it assumed every window ran at the full `--spec 4` window (S_mtp = 6), but
   `--spec-min-p 0.5` truncates T per window (`generate.cpp:7176-7179`) and suffix drafts change it too.
+
+## Part B findings (ceilings)
+
+Full table: `.megamind/src/kernels/s45-ceilings-table.md` (paste-ready as a new §9 of the doc).
+
+* **There are 13 hard 8-row limits, not 6.** §1.2 missed `kFusedGrMaxT` (`fused_gr.hpp:48`),
+  `bf16_gemv_fp32_mmvf_multi` `n_tok>8` (`native_bf16.cu:139`), `shared_expert_multi` `n_tok>8`
+  (`shared_expert.cu:172`), `kMaxWindowEntries=128` + `static_assert(MAXT*10<=128)`
+  (`expert_source.cpp:974-975`), `CAP=MAXT*10` (`remote_experts.cpp:17`), `groups_[9]`/`last_tokens_[8]`
+  (`verify.hpp:206,174`), and `moe_group_resident`'s `n<=128` (`s2_expert_grouped.cu:703`).
+* **Zero-effect verdicts:** `--spec` clamp YES; `[9]` graph arrays YES; `MAX_NCOLS` YES (standalone only);
+  `cpu::MAXT` NO (host RAM only — cheapest no); `kVerifyMaxT` NO; `GMAX` NO.
+* **`GMAX` hard-fails the build at 24/32**, measured with `nvcc -c -arch=sm_86 -Xptxas -v`:
+  69 120 B and 92 160 B against the 49 152 B static limit (`0x10e00/0x16800 vs 0xc000`). At 16 it
+  compiles but occupancy drops 5 → 2 blocks/SM. **Corrected number:** `gu_grouped_kernel` is
+  **10 560 B per GMAX entry**, not 2 560 — the batch-decode note (`batch-decode-notes.md:80`) is 4× low.
+* **Arena slope, computed from `verify.cpp:229-262` and validated at 76.943 vs the log's 76.9:**
+  **6.021 MiB/row** (5.441 buffers + 0.500 `scores_` + 0.080 `hit_scratch_`); fixed 40.625 MiB
+  (`kStagingBlobs 16 × max_blob 2 662 400`). T=8 89.042, T=12 113.240, T=16 137.438, T=32 234.229 MiB.
+  Drafter carve (`mtp.cpp:264-295`) 22.672 → 39.006 MiB. **B=2 at T=12 costs +26.9 MiB VRAM, +0.73 MiB
+  pinned RAM** — memory is not the blocker.
+* **`exec_[9]`/`groups_[9]`/`last_tokens_[8]` are OOB at T=9 with no check** (`verify.cpp:822,342,988`);
+  `GMAX<T` silently drops entries (`s2_expert_grouped.cu:554,616`) — the worst failure mode.
+* **Log fact for Part A:** 59 `captured the N-token window` lines, T=1..6 only (10/10/10/10/9/10), **zero**
+  at T=7/8, over 12 process starts. Only 6 of the 8 `exec_` slots are ever instantiated.
+* MMVQ: `g_multi_exact=true` (`native_mmvq.cu:997`) has **no caller in the engine**; ncols 9..16 is
+  bit-exact by construction but `mmvq_multi_parity.cpp:73` tests only {1,2,3,4,5,6,8} — 7 and 9..16
+  untested. The i-quant `iq_mmvq` (`iq_kernels.cu:633`) has **no ncols ceiling at all**.
+
+## S4.5-D: the "compiled code is byte-identical" claim, proved
+
+The claim in the headers' comments and in the commit message is that replacing the seven literal
+`[9]`/`[8]` shape arrays with `kVerifyMaxT`-derived expressions changes **nothing** the T <= 8 path
+compiles. That was asserted before it was checked; it is now checked.
+
+**Method.** Compile `src/core/verify.cpp` twice at the real optimisation level, once against the
+pre-change headers (`git show HEAD~1:...` staged into an override include dir) and once against the
+committed ones, and compare object hashes:
+
+```sh
+mkdir -p /tmp/oldinc/strata/core /tmp/oldinc/strata/kernels
+git show HEAD~1:include/strata/core/verify.hpp            > /tmp/oldinc/strata/core/verify.hpp
+git show HEAD~1:include/strata/kernels/verify_kernels.hpp > /tmp/oldinc/strata/kernels/verify_kernels.hpp
+
+nvcc -std=c++20 -O3 -arch=sm_86 -c src/core/verify.cpp -o NEW.o \
+     -Iinclude -Ithird_party/ggml/include
+nvcc -std=c++20 -O3 -arch=sm_86 -c src/core/verify.cpp -o OLD.o \
+     -I/tmp/oldinc -Iinclude -Ithird_party/ggml/include      # override dir FIRST
+md5sum OLD.o NEW.o
+```
+
+**Result (nvcc 13.2, sm_86, -O3):**
+
+```
+97b3330929e990a9e7238f5d277838ca  OLD.o   (162 752 B)
+97b3330929e990a9e7238f5d277838ca  NEW.o   (162 752 B)
+```
+
+Identical, same size.
+
+**Non-vacuity.** The same command with one array genuinely enlarged
+(`exec_[9]` -> `exec_[12]`, everything else untouched) gives a **different** hash and a different
+size:
+
+```
+4854706722050b6a0decfda143c89e04  BIG.o   (162 688 B)
+```
+
+So the comparison detects a real layout change; the match above is not two builds of the same file.
+
+**Trap worth repeating:** the include order decides the result. `-Iinclude` before `-I/tmp/oldinc`
+compiles the *new* headers in both arms and the hashes match trivially. Put the override directory
+first, and confirm it took effect by checking that the mutation arm changes.

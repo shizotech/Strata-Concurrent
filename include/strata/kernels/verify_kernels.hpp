@@ -20,6 +20,29 @@ namespace strata::kernels {
 
 inline constexpr int kVerifyMaxT = 8;
 
+/// S4.5-D: the number of INSTANTIATED WINDOW SHAPES, i.e. the length of every array
+/// indexed by a window's `T`: `Verifier::exec_[]`, `Verifier::groups_[]` and the six
+/// `MtpDrafter` round/step/prefill graph arrays.  Index 0 is never used (a window is
+/// T >= 1), so the length is one more than the largest T.
+///
+/// This constant exists so that raising the row ceiling cannot leave a shape array
+/// behind.  Before S4.5-D those arrays were a literal `[9]` in seven places, with no
+/// textual or compile-time link to `kVerifyMaxT` at all: `verify.cpp:822` writes
+/// `exec_[T]`, `:342` writes `groups_[T]` and `:988` writes `last_tokens_[t]` with no
+/// bounds check, so `T = 9` was silently out of bounds - undefined behaviour, not a
+/// refusal.  That is risk B1 in `docs/STAGE4-BATCH-DECODE.md` §7, and §1.2/§9.6 name the
+/// graph arrays as the ONE ceiling that can be raised with zero effect on the T <= 8
+/// path: they are inline members, never heap allocations, and `capture(T)` is lazy
+/// (`verify.cpp:822` returns at once when `exec_[T]` is already there), so a slot that is
+/// never captured costs nothing but eight bytes of a struct that already exists.
+///
+/// S4.5-D does NOT raise the ceiling.  It replaces the seven literals with this
+/// expression, which evaluates to exactly the same 9, so the compiled code is
+/// byte-identical (proved in `.megamind/src/kernels/s45-decode-slope-notes.md`), and it
+/// adds a `static_assert` at every site so a future raise of `kVerifyMaxT` either moves
+/// the arrays with it or fails to compile.
+inline constexpr int kVerifyShapeSlots = kVerifyMaxT + 1;
+
 /// For token t of T: conv over [history(3) | qkv_0 .. qkv_t] -> SiLU -> L2 norm of the q/k heads -> h[t].
 /// `history` is NOT written.  Bitwise `fused_gdn_conv_l2` per token.
 void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv_w, float* h, int channels,

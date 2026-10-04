@@ -14,8 +14,8 @@ of a word): faster than you can read.
 - **Free and open source.**
 
 > **Jump to:** [How fast?](#how-fast-is-it) · [Which model?](#which-model-should-i-pick) · [Install](#install) ·
-> [Using it](#using-it) · [Problems?](#something-went-wrong) · [How it works](#how-does-it-work) ·
-> [All the details](docs/DETAILS.md)
+> [Using it](#using-it) · [Several chats at once](#several-chats-at-once) · [What's different here](#whats-different-here) ·
+> [Problems?](#something-went-wrong) · [How it works](#how-does-it-work) · [All the details](docs/DETAILS.md)
 
 ---
 
@@ -176,13 +176,77 @@ the same way - nothing big is downloaded again.
 
 **Good to know:** by default it answers one request at a time. The first message of a chat is read in full (about 1 minute per
 30,000 tokens); after that it keeps the conversation and reads only what is new, so follow-ups start in seconds.
-Several chats can be active in one server at the same time if you add `--serve-slots N` - see
-[Several requests at once](docs/DETAILS.md#using-it).
+**Several chats at once is now supported** - add `--serve-slots N` and up to N conversations run side by side,
+each keeping its own place in the model, so an agent that fires off subagents no longer queues them one behind
+another ([details](docs/DETAILS.md#using-it)).
 It remembers up to **eight** prompts at once, so an agent that switches between different prompts - or launches
 subagents, each with its own - does not re-read the ones it will need again; the prompt it has used least recently
 is the one it forgets. **Running two Strata servers on one PC** (Linux) shares the experts between them and splits
 the CPU cores, so the second one starts in seconds and both keep their speed
 ([details](docs/DETAILS.md#several-strata-servers-on-one-pc-linux)).
+
+## Several chats at once
+
+By default Strata answers one request at a time, which is what you want when one person is typing. A coding agent
+that runs several conversations at once - or a small team sharing a machine - can instead let them overlap:
+
+```
+START-HERE.bat --serve-slots 3
+```
+
+Up to **three** conversations are then served at the same time (2 to 8 are allowed). Each one keeps its own place in
+the model, and when more are active than there are room for, Strata **puts the quietest ones to one side** and picks
+them straight back up - it never throws a conversation away and never makes you re-send it.
+
+**Requests are no longer refused because the machine is busy.** This is the biggest behaviour change. If all slots
+are full, or there is no free RAM for one more conversation, or a conversation is still being read in, your request
+**waits its turn and then runs** instead of coming back with an error. It waits up to 10 minutes by default
+(`--hold-ms`), and while it waits it is visible: the Monitor and `GET /status` show `waiting=N`, and the log prints
+`slot 2 ran after waiting 1420 ms`. You only get an error straight away for something that waiting could never fix -
+a prompt longer than the context you chose, for example.
+
+The knobs, all opt-in and all only meaningful with `--serve-slots >= 2`:
+
+| Flag | What it does | Default |
+| --- | --- | --- |
+| `--serve-slots N` | how many conversations may be served at once (2-8) | off |
+| `--hold-ms N` | how long a request that cannot run *yet* waits before it is answered with an error; `0` waits until a slot frees or you stop it | 600000 |
+| `--decode-tokens N` | how many tokens a conversation may write on its turn before the scheduler may hand the session to the next one. Bigger = fewer context switches; smaller = fairer sharing | 0 |
+| `--starve-ms N` | how long a conversation may wait for the session before the scheduler forces a swap to it | 250 |
+| `--conversation-cache-mib N` | the RAM set aside for conversations that are put to one side - this is what limits how many you can have | 8192 |
+
+`START-HERE.bat` understands `--serve-slots`, `--conversation-cache-mib` and `--starve-ms` directly. The others go in
+the `"args"` list of the `strata-<model>.json` file in the Strata folder, next to the flags the installer already put
+there.
+
+How much RAM each extra conversation needs depends on the context size you chose, and the server works it out and
+prints what is actually possible on your machine **before the first request arrives**. If a conversation as long as
+your context limit could never be put to one side, it says so and serves conversations that long one at a time -
+naming both numbers - instead of discovering it halfway through an answer. Raise `--conversation-cache-mib` or lower
+`--max-context` to get real concurrency back.
+
+## What's different here
+
+This is a fork of [Strata](https://github.com/Niko1221/Strata) focused on **concurrency**: running several
+conversations at once without them destroying each other's speed. Everything upstream still works the same way, and
+the changes are opt-in.
+
+- **Serve several conversations at the same time** (`--serve-slots N`), with each conversation keeping its own
+  position, cache and memory budget.
+- **Conversations are put to one side and picked back up** instead of being re-read from scratch. A parked
+  conversation costs what it actually holds, not what its context limit allows it to grow to, and the least recently
+  used one is the one that moves out.
+- **Requests wait instead of failing** (`--hold-ms`) - see [Several chats at once](#several-chats-at-once) above.
+- **A token budget per turn** (`--decode-tokens`) so the sharing is decided by how much work a conversation has
+  done, not by how many steps it happened to take.
+- **Fairness limits** (`--starve-ms`) so a busy conversation cannot hold the model forever.
+- **A shared experts file** (`--shared-expert-arena`, Linux) so several Strata servers on one PC use the same copy of
+  the model in RAM instead of one copy each.
+- **Everything is visible while it runs**: the log prints a periodic `activity:` line (which slots are working, which
+  are parked, how many are waiting, how long each has waited), and `GET /status`, `GET /slots` and `GET /metrics`
+  report the same thing to tools.
+
+Nothing here changes the answers you get. With `--serve-slots` off, Strata behaves exactly as upstream.
 
 ## Something went wrong?
 

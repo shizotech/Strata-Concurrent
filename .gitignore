@@ -49,3 +49,11 @@ build-vision.bat
 *.done
 /third_party/*.zip
 
+
+# agent scratch: one-shot command scripts and probe programs
+.shz_cmd/
+
+# bench/decode-slope: regenerable output derived from strata-*.log (which is not tracked).
+# Keep report.md (the human-readable result); the raw per-request dumps are 7.6 MB of derived data.
+bench/decode-slope/baseline/*.json
+bench/decode-slope/baseline/*.csv

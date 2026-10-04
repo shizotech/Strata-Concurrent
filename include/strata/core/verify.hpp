@@ -27,6 +27,7 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/verify_kernels.hpp"   // S4.5-D: kVerifyShapeSlots for exec_/groups_/last_tokens_
 
 #include <cuda_runtime.h>
 
@@ -171,10 +172,22 @@ private:
     int max_t_ = 0;
     int last_t_ = 0;
     int64_t last_pos0_ = 0;
-    int32_t last_tokens_[8] = {};
+    // S4.5-D: `last_tokens_` is indexed by the window ROW t < T (verify.cpp:988 writes it,
+    // :1188 reads it), so it needs kVerifyMaxT slots.  `exec_` is indexed by the window
+    // SHAPE T (verify.cpp:822 writes it, :991 launches it), and index 0 is never used, so
+    // it needs kVerifyMaxT + 1.  Both were literals with no link to kVerifyMaxT; the
+    // asserts below make the link compile-time.  The values are unchanged (8 and 9), so the
+    // compiled code is byte-identical - proved by md5 in
+    // .megamind/src/kernels/s45-decode-slope-notes.md.
+    int32_t last_tokens_[strata::kernels::kVerifyMaxT] = {};
+    static_assert(sizeof(last_tokens_) / sizeof(last_tokens_[0]) >= strata::kernels::kVerifyMaxT,
+                  "last_tokens_ is indexed by window row t < T <= kVerifyMaxT (verify.cpp:988)");
     int64_t n_vocab_ = 0;
     cudaStream_t cs_ = nullptr;
-    cudaGraphExec_t exec_[9] = {};
+    cudaGraphExec_t exec_[strata::kernels::kVerifyShapeSlots] = {};
+    static_assert(sizeof(exec_) / sizeof(exec_[0]) > strata::kernels::kVerifyMaxT,
+                  "exec_[T] is written for T up to kVerifyMaxT (verify.cpp:822) - the array must have "
+                  "kVerifyMaxT + 1 slots or T = kVerifyMaxT is out of bounds");
     cudaGraphExec_t commit_exec_ = nullptr;
 
     // mapped staging (host pointer, device alias)
@@ -203,7 +216,10 @@ private:
     static void publish_plan(void* ctx);
     void set_plan_slot(int grp);
     bool split_ = false;   // opt-in (--spec-split): exact but slower, see the overlap study
-    int groups_[9] = {};
+    int groups_[strata::kernels::kVerifyShapeSlots] = {};
+    static_assert(sizeof(groups_) / sizeof(groups_[0]) > strata::kernels::kVerifyMaxT,
+                  "groups_[T] is written by record_window (verify.cpp:342) and read by run/commit "
+                  "(:997, :1130) for T up to kVerifyMaxT");
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
 
     // device
