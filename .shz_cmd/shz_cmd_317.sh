@@ -1,0 +1,1 @@
+cd /tmp/s42build && ls | grep -i "conversation" ; echo "--- run them ---"; ./conversation_cache_test 2>/dev/null | tail -1; find . -name "conversation_memory_test*" -o -name "conversation_cache_test*" | head

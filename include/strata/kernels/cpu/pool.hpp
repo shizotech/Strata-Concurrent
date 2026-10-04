@@ -37,6 +37,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -68,8 +69,65 @@ struct ExpertJobMulti {
 /// logical processors 0..5 would put every worker on a sibling pair and halve the useful bandwidth - which is
 /// exactly the kind of error that shows up as "the CPU path is slower than the model says" with no clue why.
 ///
-/// `skip_first` drops the first core, which P2.S3 reserves for the host loop.
+/// `skip_first` drops the first core, which P2.S3 reserves for the host loop.  **A2: that reservation is no
+/// longer implicit** - `ExpertPool::host_core()` names the CPU the pool actually kept for the host, and it is
+/// not necessarily `physical_cores(false)[0]` once another strata process is on the machine.  Prefer it.
 std::vector<int> physical_cores(bool skip_first);
+
+// ---- A2: THE CORES ARE A MACHINE-WIDE RESOURCE, NOT A PER-PROCESS ONE ----
+//
+// WHY THIS EXISTS.  Two `strata --serve` processes on one machine each pinned their 5 expert-pool
+// workers to CPUs 1..5 and their host thread to CPU 0, so 12 hard-pinned runnable threads were
+// crammed onto 6 logical CPUs while the 6 SMT siblings (6..11) sat completely idle.  The OS then had
+// to timeslice them, and because the pool's waits are `_mm_pause` spin loops, every preemption of a
+// spinner burned a whole timeslice from the thread that was doing the real work.  That is the
+// reported "one process at 400 % CPU, the other at 80 %, both drop hard" - and it is NOT a lock:
+// there is no lock anywhere in the shared-arena read path (verified by grep; the only mutexes are the
+// pool's sleep CV, the PLE reader's and the load-error ones).
+//
+// So the fix is a partition, not a lock.  A process asks the machine which logical CPUs the OTHER
+// strata processes already hold, and takes a disjoint set:
+//
+//   1. free physical cores first (one logical CPU each, exactly what a lone process gets today);
+//   2. then the SMT SIBLINGS of cores somebody else is using - two threads on one physical core is
+//      SMT sharing (each keeps its own CPU, no preemption, no stolen timeslice), which is strictly
+//      better than 12 threads timesliced over 6 CPUs;
+//   3. only if even that is exhausted, share a CPU and SAY SO.
+//
+// Discovery has two independent sources, because either one alone is not enough:
+//
+//   * a flock-guarded lease file (`/dev/shm/strata-core-leases`, fallback `/tmp/...-<uid>`), which
+//     is exact and covers processes built with this code; and
+//   * a `/proc` scan for other processes whose `comm` starts with "strata" and whose threads are
+//     pinned to a single CPU, which covers a server that is ALREADY RUNNING an older binary and
+//     therefore wrote no lease. Without that second source, rolling this out would leave the first
+//     old server and the first new one colliding exactly as before.
+//
+// The kernel threads on a Linux box pin themselves to every CPU (IRQ affinity and friends), so the
+// scan is deliberately restricted to strata processes; counting everything would mark all 12 CPUs
+// claimed on any machine and force the fallback, which is a nice way to fix nothing.
+struct CorePlan {
+    std::vector<int> host;       ///< the logical CPU this process claimed for its HOST thread
+    std::vector<int> workers;    ///< logical CPUs for pool workers, disjoint from `host`
+    std::vector<int> foreign;    ///< logical CPUs already held by OTHER strata processes
+    std::string note;            ///< what was taken and why - the startup print reads this
+    bool shared = false;         ///< another strata process holds cores on this machine
+    bool leased = false;         ///< the cross-process lease file was usable
+    bool overridden = false;     ///< STRATA_POOL_CORES decided this plan
+    /// How many of this plan's threads sit on a logical CPU ANOTHER strata process also pinned.  Non-zero means
+    /// the OS must timeslice them, which is the one case where a `_mm_pause` park spin is actively harmful to
+    /// the other tenant - see `ExpertPool`'s constructor and `kSpinBeforeSleep`.
+    int oversubscribed = 0;
+};
+
+/// Claim one host CPU plus `want_workers` worker CPUs for this process.  Idempotent: a second call
+/// with the same count returns the same plan; a different count releases the old lease and re-claims.
+/// Never fails - when the machine is full it returns today's assignment and says so in `note`.
+const CorePlan& claim_cores(int want_workers);
+/// The plan as claimed so far - EMPTY (no host, no workers) if `claim_cores` has not run yet; it never
+/// claims anything itself.  `ExpertPool`'s constructor and the session's host pin both read this, which is
+/// the only way the host and the workers can be kept off each other's cores.
+const CorePlan& core_plan();
 
 /// **THE RESERVATION IS A FICTION UNLESS THE HOST IS ACTUALLY PUT THERE.**
 ///
@@ -87,8 +145,15 @@ void restore_thread_affinity(long long previous);
 
 class ExpertPool {
 public:
-    /// `n_workers <= 0` means "every physical core except the first".  Workers are pinned to physical cores
-    /// (minus core 0 by default) and each owns one `ExpertScratch`, so nothing in the token path allocates.
+    /// `n_workers <= 0` means "every physical core this process may take, except the one kept for the host".
+    /// Workers are pinned one per physical core and each owns one `ExpertScratch`, so nothing in the token
+    /// path allocates.
+    ///
+    /// **A2: WHICH CORES THAT MEANS IS DECIDED BY THE MACHINE, AND THE POOL SAYS WHAT IT GOT.**  The set comes
+    /// from `claim_cores()` (see `CorePlan`), so with a second strata process on the box the workers land on
+    /// disjoint logical CPUs instead of both processes nailing the same six.  `note()` reports the CPUs and the
+    /// reason; `host_core()` names the CPU the host thread should use; `worker_cores()` lists the workers'.
+    /// `pin=false` claims nothing at all (a pool that will not use cores must not lease them).
     ///
     /// **`host_works` PUTS THE HOST THREAD INTO THE DRAIN (R2.2's FIRST HALF).**
     ///
@@ -112,6 +177,19 @@ public:
     /// Whether the host thread also drains.  Reported at startup, because "the engine adapts to the machine it
     /// is on" is only true if the engine says which adaptation it took.
     bool host_works() const { return host_works_; }
+
+    /// **WHICH CORES THIS PROCESS TOOK, AND WHY** (A2).  Same pattern as `ArenaExpertSource::note()`: the pool
+    /// decides its own core assignment from what the machine is doing, so only the pool can say what it got, and
+    /// the parent prints it at startup.  Never empty; it names the CPUs, whether another strata process is on
+    /// this machine, and it SHOUTS when the machine is oversubscribed rather than letting the slowdown be a
+    /// mystery.  `pin=false` pools report "not pinned" instead of a core list.
+    const std::string& note() const { return note_; }
+    /// The logical CPU the pool asked the host thread to use (`-1` = unpinned / no reservation).  This is the
+    /// core `physical_cores(true)` used to reserve implicitly; `session.cpp` pins the host to it so the two
+    /// halves of the reservation cannot drift apart when a second process changes the split.
+    int host_core() const { return host_core_; }
+    /// The logical CPUs the workers were pinned to, in worker order (`-1` = unpinned).
+    const std::vector<int>& worker_cores() const { return worker_cores_; }
 
     /// Publish `n` jobs, then block until every one has been claimed AND every worker has parked.
     /// `jobs` must outlive the call (it does, and the workers never touch it afterwards).
@@ -158,6 +236,14 @@ public:
     /// between requests: with most experts in VRAM (a 24 GB card) many layers have no CPU work, so the workers
     /// also sleep mid-request - which the claim protocol above must survive (issue #29).
     /// `STRATA_POOL_SPIN_US` overrides it (a test knob: a short spin makes the workers sleep constantly).
+    ///
+    /// **A2: THE SPIN IS CUT TO 200 us WHEN THE PROCESS HAS TO SHARE A CPU.**  Spinning is free on a core this
+    /// process owns and theft on a core it shares: the spinner is not idle there, it is RUNNING, and every
+    /// timeslice it burns is a timeslice the other tenant's real work did not get.  The cut happens only when
+    /// the core plan reports `oversubscribed > 0` (see `CorePlan`), never merely because another process exists
+    /// - with a disjoint core set the spin costs the neighbour nothing.  `STRATA_POOL_SPIN_US` still wins, and
+    /// the cut is reported in `note()`.  Measured: a competitor sharing the same three CPUs ran 2-3x slower
+    /// behind a 20 ms spinner than behind a 200 us one.
     static constexpr std::chrono::milliseconds kSpinBeforeSleep{20};
     /// A pool wait that sees no completion for this long is a bug; the engine stops with a message instead of
     /// spinning forever, and the server starts it again (issue #29).
@@ -179,6 +265,11 @@ private:
 
     int n_ = 0;
     bool host_works_ = true;
+    // A2: what this process was given, and where.  Set once in the constructor, read by `note()`,
+    // `host_core()` and `worker_cores()`; never mutated afterwards, so no atomics and no lock.
+    std::string note_;
+    int host_core_ = -1;
+    std::vector<int> worker_cores_;
     ExpertJob* jobs_ = nullptr;
     int njobs_ = 0;
     /// The host's own scratch when `host_works_`.  A separate object rather than a share of `scratch_[i]`,

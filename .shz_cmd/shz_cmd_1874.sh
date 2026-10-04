@@ -1,0 +1,1 @@
+cd /ssd/Strata; sed -n '6536,6542p' src/program/generate.cpp; echo "=== are both publish call sites inside the driver block? ==="; for L in 7796 8289; do printf "line %s: " $L; awk -v n=$L 'NR<=n && /if \(driver_on\)/ {d=NR} NR<=n && /while \(next_line\(line\)\)/ {s=NR} END{print (d>s && d>0) ? "driver block" : "SERIAL or elsewhere"}' src/program/generate.cpp; done

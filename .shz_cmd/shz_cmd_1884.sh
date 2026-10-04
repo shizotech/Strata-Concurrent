@@ -1,0 +1,1 @@
+cd /ssd/Strata; grep -n "STRATA_SERVE_TRACE" src/program/generate.cpp | head; echo "---docs---"; grep -c "S3.6" docs/STAGE3-CONCURRENCY.md; echo "---end_slot---"; grep -n "end_slot" src/program/generate.cpp | head -4

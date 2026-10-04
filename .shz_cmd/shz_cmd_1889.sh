@@ -1,0 +1,1 @@
+cd /ssd/Strata; cp /tmp/sdrv.bak include/strata/program/serve_driver.hpp; echo "MUTANT left: $(grep -c MUTANT include/strata/program/serve_driver.hpp)"; cd /tmp/s3build && ninja 2>&1 | grep -cE " error "; ./serve_driver_test | tail -1; ./serve_swap_test | tail -1; ctest 2>&1 | grep -E "tests passed"

@@ -1,0 +1,1 @@
+cd /ssd/Strata; echo "=== --help documents the new switch? ==="; grep -n "STRATA_SERVE_TRACE\|STRATA_ACTIVITY" src/program/generate.cpp | head; echo; echo "=== docs updated? ==="; grep -n "S3.6\|parking collapse\|STRATA_SERVE_TRACE" docs/STAGE3-CONCURRENCY.md | head -8; echo; echo "=== end_slot defined? ==="; grep -n "auto end_slot = " src/program/generate.cpp

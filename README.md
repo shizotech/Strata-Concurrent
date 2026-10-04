@@ -174,8 +174,15 @@ the same way - nothing big is downloaded again.
 - **Experimental speed projection (off by default):** an experimental control vector that setup can turn on; it
   changes how the model answers - read [what it does](docs/DETAILS.md#experimental-speed-projection-experimental-off-by-default) first.
 
-**Good to know:** it answers one request at a time. The first message of a chat is read in full (about 1 minute per
+**Good to know:** by default it answers one request at a time. The first message of a chat is read in full (about 1 minute per
 30,000 tokens); after that it keeps the conversation and reads only what is new, so follow-ups start in seconds.
+Several chats can be active in one server at the same time if you add `--serve-slots N` - see
+[Several requests at once](docs/DETAILS.md#using-it).
+It remembers up to **eight** prompts at once, so an agent that switches between different prompts - or launches
+subagents, each with its own - does not re-read the ones it will need again; the prompt it has used least recently
+is the one it forgets. **Running two Strata servers on one PC** (Linux) shares the experts between them and splits
+the CPU cores, so the second one starts in seconds and both keep their speed
+([details](docs/DETAILS.md#several-strata-servers-on-one-pc-linux)).
 
 ## Something went wrong?
 

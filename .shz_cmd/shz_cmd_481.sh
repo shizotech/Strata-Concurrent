@@ -1,0 +1,1 @@
+cd /ssd/Strata && g++ -std=c++20 -O1 -Wall -Wextra -Iinclude -c src/core/conversation_wire.cpp -o /tmp/s431scratch/wire.o 2>&1|head -20 && cd /tmp/s431scratch && g++ -std=c++20 -O1 -o wiretest wire.o test.o fnvstub.cpp -I/ssd/Strata/include 2>/dev/null; ./wiretest; echo "exit=$?"

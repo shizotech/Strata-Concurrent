@@ -1,0 +1,1 @@
+cd /ssd/Strata && grep -n "max_cells\|session_init\|cudaMalloc\|SKIP\|return 77\|n_layers\|max_context" src/core/conversation_snapshot_test.cpp | head -40; echo "=== head ==="; sed -n '1,50p' src/core/conversation_snapshot_test.cpp

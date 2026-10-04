@@ -127,6 +127,21 @@ whole chunk at once; unpinned experts are copied by helper threads. Measured on 
 switch to `--prefill auto` the next time START-HERE / setup.sh starts them. The raw numbers:
 [`bench/results/`](../bench/results/). The [paper](paper/Strata-Paper.pdf) explains every number.
 
+**The prompt path borrows expert-cache slots, and that loan is a per-request cost.** `--serve` lays the
+prompt path's chunk buffers in the tail of each stage's expert cache, marks the experts there
+non-resident for the duration of the read, and streams them back afterwards - so outside a prompt the
+cache is whole again for decode. On a 3-GPU machine with ~100 % of the routed mass resident, that
+refill (4.95 GiB per stage here) is most of the ~9.5 s per-request floor measured over 1 600 live
+requests; it does not scale with the cached context. Three things are therefore done only when they
+have to be: the layout is reused when the next segment needs the same chunk and slot range, a loan is
+widened in place instead of being handed back and re-taken, and the residency table is re-uploaded to
+the devices only when its content actually changed (the batched prompt reads the host table; only the
+verify windows read the device copy). `STRATA_PREFILL_STICKY_LOAN=0`, `STRATA_RES_UPLOAD_ALWAYS=1` and
+`STRATA_PARK_REFUSALS=0` revert each; `STRATA_PREFILL_LOAN_TIMING=1` prints the loan's cost per lend,
+per refill and per request. The decisions are pure and unit-tested in
+`include/strata/program/prefill_loan.hpp`; the measurement and the lever ranking are in
+[`bench/prefill/`](../bench/prefill/README.md).
+
 ## Other GPUs (estimated)
 
 Not measured - estimated from the runs above (same CPU and 64 GB RAM): the GPU part scaled by memory bandwidth, the CPU
@@ -322,6 +337,49 @@ Terminal chat: `.venv/bin/python chat.py`.
 
 ---
 
+## Several Strata servers on one PC (Linux)
+
+You can run more than one model server on the same machine - two models, or the same model twice on two cards.
+Each server is its own process with its own weights on its own GPU, and the two things they would otherwise
+duplicate are shared instead:
+
+- **The experts are loaded once, not once per server.** The 34-50 GB of expert weights live in one file
+  (`--shared-expert-arena`, default `/dev/shm/shared_experts.dat`) that every server maps. The first server to
+  start loads them; the others map the same bytes and load nothing, so a second server starts in seconds instead
+  of a minute and the machine holds ONE copy of the experts rather than one per server. The file is on
+  `/dev/shm` (RAM), so it counts against your RAM exactly once. The engine says which it did:
+  `expert arena: SHARED ARENA BORROWED, experts not re-loaded` versus `loaded 46.84 GiB at 1.42 GiB/s`.
+  A second server that starts while the first is still loading waits for it rather than reading a half-written
+  arena, and if the first one dies mid-load the second takes the load over. Put the file somewhere else with
+  `--shared-expert-arena /path/to/file`, or use a private arena per server with `--shared-expert-arena ""`.
+  If the shared file cannot be used - Docker's default `/dev/shm` is 64 MiB, the path may be read-only, or the
+  file may hold a different model's experts - the engine falls back to a private arena and says why.
+  Windows has no shared arena yet (each server keeps its own), and `--mmap-experts` does not use one either.
+- **The two servers do not fight over the CPU cores.** The CPU expert path pins its threads to physical cores,
+  and two processes that both pinned the same six cores measured **2.5-3x slower each** than two processes on
+  different cores - that is what a "one server at 400 % CPU, the other at 80 %" slowdown looks like from the
+  outside. Each server now claims cores no other Strata process holds (falling back to the SMT siblings, and
+  only then to sharing), and prints what it got:
+  `strata generate: cores: host 0 + workers 1-5 (6 physical cores, no other strata process on this machine; lease /dev/shm/strata-core-leases)`.
+  With a second server running it takes the other half and says why: `... host 6 + workers 7-11 (6 free physical
+  core(s), 1 other strata process(es) on this machine, so this one took a disjoint set ...)`.
+  Override with `STRATA_POOL_CORES=6,7,8`, or turn the discovery off with `STRATA_POOL_CORES=none`.
+
+One trade-off on the experts side, and the engine reports it either way: a shared arena is a file, and files are
+mapped with 4 KB pages. A PC that has a huge-page pool configured (`vm.nr_hugepages`) would otherwise get 2 MB
+pages for its experts, which is better for one server and worse for two. The startup line says which you got -
+`MAP_SHARED file /dev/shm/shared_experts.dat` or `hugetlb 2 MB pages` - and `--shared-expert-arena ""` asks for
+the private, huge-page arena on a single-server PC.
+
+Both are per-machine, not per-model. Two servers of the **same** model share one arena; two servers of
+**different** models cannot, because the file records which model's experts it holds and refuses a mismatch - the
+second one falls back to a private arena and says so, which means that model's experts are in RAM twice. If you
+run two different models, give each its own file: `--shared-expert-arena /dev/shm/experts-iq2_xs.dat` and
+`.../experts-coder.dat`. Serving two requests at the same time from ONE server is a different thing: it is
+`--serve-slots N` (opt-in, off by default) - see "Several requests at once" below.
+
+---
+
 ## Sharing the GPU with other programs (optional)
 
 By default the model stays loaded until you close Strata. On a PC that also games, renders or runs another model
@@ -418,17 +476,126 @@ prompt when that is 2,048 tokens or more (engine 0.1.20; PR #62 + #65), so that 
 system prompts and tool lists. Engine options: `--prompt-cache N` (0 = off), `--prompt-cache-every N`,
 `--prompt-cache-root N` (0 = no system-prompt checkpoint), `--turn-token ID`.
 
-**Multiple conversations (opt-in).** Add `--conversation-cache-mib 8192
---conversation-cache-slots 4` to the engine arguments to park up to four conversations
-in a bounded 8 GiB host-RAM cache. This preserves controller/worker histories when
-their requests alternate; it does not execute requests concurrently. No client session
-ID is required: only exact token/image prefixes with matching steering mode are reused.
-The default budget is 0 (disabled); `--prompt-cache 0` also disables parking.
-The initial shared-core integration supports a single session GPU: combining
-enabled parking with `--layer-split` is rejected before model loading. Ordinary
-upstream layer-split checkpoints remain available with parking disabled. FP16,
+**Multiple prompts at once.** The engine can park whole prompts in host RAM so a client that switches
+between them does not rebuild one from scratch on every switch - an agent that launches subagents with
+different system prompts, or a controller and its workers taking turns. `--conversation-cache-mib N` is
+the host-RAM budget for that parking (0 turns it off), for example `--conversation-cache-mib 8192`.
+Up to **eight** prompts live there at a time (`--conversation-cache-slots N`, default 8). When the
+ninth arrives, or when the budget runs out, the engine drops the prompt it has **not used for the
+longest**, not the one it parked first: every request that resumes from a parked prompt marks it as
+freshly used, so the prompts you actually keep switching between stay warm and the ones you
+abandoned are what get pruned. No client session ID is required: only exact token/image prefixes
+with matching steering mode are reused. `--prompt-cache 0` also disables parking.
+Parking on its own **does not run requests at the same time** - it saves the re-read. Running them
+together is `--serve-slots N`, the next section; parking is what makes that possible, because a
+request that is not currently in the session has to be saved somewhere.
+
+**Several requests at once (opt-in, off by default).** `--serve-slots N` (2..8) lets
+one server process keep N conversations **active at the same time**: while one is reading its prompt,
+another is writing its answer, and neither sees the other's tokens. It is off unless you ask for it -
+with no flag, or `--serve-slots 0` or `1`, the engine is exactly the serial one it has always been,
+byte for byte on the wire.
+
+```
+START-HERE.bat --setup ...        then add to the engine args in strata-<model>.json:
+  --serve-slots 3 --starve-ms 250 --decode-tokens 10 --conversation-cache-mib 12288
+```
+
+How it works, because the trade-off is real: the GPU still does **one thing at a time**. What changed
+is that the engine now decides that at the level of a *step* - one verify window, one prompt chunk,
+one conversation swap - instead of running a whole request to the end. A conversation that is not
+currently in the session is saved to host RAM (the parking cache above) and mounted back when it is
+its turn, so `--serve-slots N` needs a parking budget: with `--conversation-cache-mib 0` the engine
+says so and stays serial. Requests are cancelled individually (`STOP <id>`), each gets its own
+sampling, penalties, drafts and checkpoints, and `GET /slots` shows what the engine thinks each one
+is doing.
+
+**How much of an answer one conversation writes before it is swapped out (`--decode-tokens N`).** A
+decode step used to be exactly **one verify window**, and a window accepts 1..8 tokens depending on
+how many of the MTP's drafts the model agreed with - so a slot emitted ~1-3 tokens and then the
+scheduler moved to the next conversation. That is a lot of swapping for very little work: every
+possible hand-over boundary pays a save+restore of that conversation's state (hundreds of MB to a
+couple of GB). `--decode-tokens N` sets the size of a slot's **turn in tokens**: the engine keeps
+running verify windows for the same conversation until it has produced N tokens, and only then lets
+the scheduler take the session away. It is a token budget, not a window count, so `--decode-tokens 10`
+means "about ten tokens" whatever the acceptance rate happens to be that round; a window may overshoot
+it, because a window is the smallest unit of work there is. The request still stops early on EOS, on
+`--max-new`, or on `STOP <id>`. `0` (the default) or `1` is the old one-window-per-turn behaviour.
+With `--serve-slots 0/1` the flag changes nothing you can see: the serial loop calls the decode step
+until the request is done anyway, so it produces the same windows in the same order either way.
+Raise it when the swap cost dominates (long conversations, few clients); lower it when you want the
+interleaving to feel even. The driver's start-up line prints what is in force
+(`decode 10 tokens/turn` vs `decode 1 window/turn`), and it interacts with `--starve-ms`: a longer
+turn means a slot holds the session longer before fairness forces a swap.
+
+What it costs: a swap is a save+restore of that conversation's state - hundreds of MB to a couple of
+GB - so `--starve-ms` (default 250) is the dial between fairness and memcpy. A slot needs its
+conversation to fit the parking budget, and on a PC already holding 47 GB of experts that is the
+binding limit, not the GPU. Two conversations do **not** share one decode batch: this is per-request
+concurrency, not the packed-batch trick, and the reason is in the paper - the model's recurrent
+layers carry one state per sequence. The design, the measurements and the staged plan:
+[`docs/STAGE3-CONCURRENCY.md`](STAGE3-CONCURRENCY.md).
+
+**This is new and it has not been measured on a live model yet.** It builds, and its decision logic
+is unit-tested without a GPU, but if two clients at once misbehave on your machine, `--serve-slots 0`
+turns it off without a rebuild and `STRATA_NO_SWAP=1` turns off only the swapping.
+
+What it costs in RAM is the honest part: a parked prompt is a full snapshot of that conversation -
+running state, its checkpoints, the K/V pages it uses and the draft layer's K/V - so it is roughly
+what the live session already costs for that chat, again. With a `--layer-split` that means every
+stage's share of it, which is the same total: the split divides the state across GPUs, it does not
+duplicate it. A checkpoint is ~118 MB, and a snapshot
+holds one per assistant turn plus the K/V pages, so a long chat is hundreds of MB to a few GB.
+Eight of them is a real number: the budget you set is what decides how many actually fit, and the
+engine stops parking before it exceeds it. The engine log prints each snapshot's size
+(`snapshot_bytes`) and how many prompts are parked, so you can see what your own prompts cost before
+raising the budget. An 8 GiB budget is a cap, not a recommendation for every machine.
+
+**The default budget follows the machine.** 8 GiB is the ceiling, but if the PC has less than that to
+spare - after the parking floor below and 4 GiB kept for the next request's own allocations - the
+engine starts with what is actually free and says so (`parked-prefix budget 1.2 GiB, not 8.0: ...`).
+That is deliberate: a snapshot budget the machine cannot pay for is paid for by dropping the file
+cache the experts and the lookup table live in, which makes the server slower than the feature it
+just gained. Set `--conversation-cache-mib N` and the engine uses exactly N and does not second-guess
+you; `--conversation-cache-mib 0` parks nothing.
+
+**Nothing is reserved per slot.** A common worry is that `--serve-slots 3` at `--max-context 524288`
+means three conversations each holding 524288 tokens' worth of K/V, so the budget has to cover the
+worst case three times over. It does not. A parked conversation is sized by the tokens it actually
+holds, not by what `--max-context` allows it to grow to, and the cache counts what it stored. These
+are real parks from one run at `--max-context 524288`:
+
+| conversation | parked snapshot |
+|---|---|
+| 81 tokens | 226 MiB |
+| 150 tokens | 340 MiB |
+| 10 800 tokens | 777 MiB |
+| 34 000 tokens | 1.4 GiB |
+| 95 000 tokens | 2.4 GiB |
+| 524 288 tokens (the ceiling) | 7.6 GiB |
+
+The shape of it: a **fixed floor of a couple of hundred MiB** - the recurrent state, the indexer
+state and the draft layer's K/V, which every conversation pays whatever its length - plus roughly
+**15-30 KiB per context token**, plus about 110 MiB for each checkpoint the conversation retains. So
+the budget you need is roughly `slots x floor + sum of your real conversation lengths x the rate`,
+not `slots x max_context x the rate`. The startup line prints both figures - the rate
+(`a parked conversation costs about N B per context token`) and the worst case
+(`a conversation at this --max_context parks in N MiB`) - and `--serve-slots` admission charges each
+request against its own prompt length plus the `max_new` it has yet to write, at that rate, instead
+of against a flat share of the budget. If a conversation genuinely cannot be parked, the engine says
+so before the first request, with both numbers, and it refuses that hand-over instead of destroying
+the conversation - see the `park:`, `a conversation at this --max_context` and
+`admit slot N refused` lines in the log.
+
+Parking works with a **layer split** (multi-GPU) too: a parked conversation carries the first
+stage's running state and K/V, one part for every later stage's own layer range, and the draft
+layer's K/V from the stage the drafter lives on. The snapshot is all-or-nothing across the split
+as it already was on one GPU - every stage is validated before any of them is written - and the
+byte budget counts every part, so a split's snapshots cost what they actually cost. A parked
+image is tied to the `--layer-split` it was captured from: change the split and the parked
+conversations are refused rather than half-mounted. FP16,
 INT8, Q4_0 and identity-layout K8V4 snapshots are supported; the K8V4 draft ring
-remains INT8, as in upstream. Windows/HIP and multi-GPU runtime coverage must be
+remains INT8, as in upstream. Windows/HIP runtime coverage must be
 reported separately from Linux/CUDA evidence.
 
 Snapshots contain running state, checkpoints, used K/V pages, and draft-layer K/V.
@@ -440,26 +607,123 @@ checkpoints are captured again. Retained active K/V counts against the same byte
 budget and is discarded before evicting parked entries under memory pressure.
 If reserving space for growth would evict another conversation, parking uses a
 full capture instead.
-Oldest parked entries are evicted first.
+When there is not enough room, the parked conversation that has gone longest
+without use is evicted first - not the one parked first - and the eviction count
+is logged.
 Oversized snapshots or host allocation failures fall back to ordinary prompt processing.
 `--conversation-cache-min-free-mib N` (default 2560) additionally requires that
 physical-RAM headroom remain available: the engine checks before allocation and
 again after capture. Unknown telemetry or insufficient RAM skips parking. Windows
 uses `GlobalMemoryStatusEx`, Linux uses `MemAvailable`; these are host-level samples,
-not a reservation or enforcement of container/job memory limits. An 8 GiB budget
-is a cap, not a recommendation for every machine.
+not a reservation or enforcement of container/job memory limits.
 
-The shared snapshot core validates all layers and checkpoints before applying any
-state. Invalid entries are discarded; transfer/synchronization failure is fatal
+The shared snapshot core validates all layers and checkpoints - on every stage of a layer split,
+and the draft layer - before applying any state. Invalid entries are discarded; transfer/synchronization failure is fatal
 rather than permission to continue with partial state. Indexer spare keys and the
 moving spare row are preserved, including checkpoint rewinds.
+**Mounting and unmounting a conversation (`--serve-slots`, stage 3 S3.1d).** With
+`--serve-slots N` (N >= 2) the engine can hand the one live session from one conversation to another
+*between steps*, instead of only at a request boundary. There is still exactly one live session and
+one set of captured CUDA graphs - a second one does not fit in the VRAM this box has - so a hand-over
+is a save and a restore through the same parked-conversation machinery above, never a re-capture.
+The order is fixed and it is the part that has to be right:
+
+1. drain any expert-cache swaps still in flight (`apply_pending(true)`) - a snapshot taken over a
+   half-applied residency table describes a cache that does not exist;
+2. give the prompt loan back (`refill()`) - the loan is the tail of one cache, for the same reason;
+3. **validate** the incoming snapshot, which writes nothing anywhere;
+4. unmount: save the outgoing conversation into the cache;
+5. mount: restore the incoming one into the session;
+6. restore the drafter's K/V ring;
+7. move the per-slot conversation state in (its live tokens, its checkpoint chain, its steering mode,
+   the suffix drafter's history, its sampling and its image positions);
+8. re-establish the per-slot device state - the one M-RoPE position table and the control-vector mode.
+
+Validating before saving is what makes a rejected snapshot cost nothing: the outgoing conversation is
+still mounted and the request falls back to re-reading, exactly as it does today. A restore that
+fails after its first write is still fatal to the session, as it has always been. A conversation the
+engine could **not** park (budget or physical-RAM admission refused) is marked un-resumable and
+re-read from token 0 rather than mounted back on top of stale K/V - the one case where a silent
+"plausible tokens" failure would otherwise be reachable.
+
+**A prompt read that is still in progress is parked too.** A hand-over away from a conversation whose
+prompt is only half read used to save nothing and send it back to token 0 on the way in - which is
+fine once, and a livelock repeated, because two conversations both reading long prompts would each
+throw the other's progress away on every swap and neither would ever finish. A read that has consumed
+tokens is now treated like a decode: its state is saved and the read resumes at the token it stopped
+at, so `saved`/`restored` are non-zero on those swaps as well. If such a read genuinely cannot be
+parked, the engine no longer restarts it forever - after four resets it ends the request with a named
+error that says so, rather than spinning invisibly.
+
+**A parked conversation belongs to the request that is still running.** A parked entry is one object -
+its branch, its checkpoint chain and its K/V pages - and a new request looks a branch up by *prefix*,
+so two chats that share a beginning could collide: the new request matched one of the other slot's
+checkpoints, mounted, and thereby removed the entry that held a running conversation's whole branch.
+That conversation then could not be handed back and was ended. A parked branch is now claimed by its
+owner for as long as that request runs, and another request may not mount it - it reads a little more
+of its own prompt instead. The claim is released when the request finishes, so the next request of the
+same chat still resumes from the parked prefix exactly as before, and the cache's byte budget still
+wins: if everything parked is claimed, the least recently used one is pruned after all.
+
+Every hand-over prints its price on stderr, and the running totals are counted so the cost of
+swapping can be measured rather than guessed:
+
+```
+strata serve: swap 3: slot 7 -> 9 ok in 142 ms; saved 1073741824 B, restored 805306368 B, parked=3 bytes=2834305024 (total 3 swaps, 401 ms, 3019898880 B out / 2415919104 B in)
+```
+
+`STRATA_NO_SWAP=1` turns hand-overs off without a recompile: the wire stays id-tagged, but every
+request runs serially against the one mounted slot - 0.1.30's behaviour. `--serve-slots 0` (the
+default) and `--serve-slots 1` never take this path at all.
+
+**Running N conversations at once (stage 3 S3.1e-2).** With `--serve-slots N` (N >= 2) and a
+conversation cache that has a budget, the serve loop stops being "one request to completion" and
+becomes "one step of one slot at a time": the engine reads request lines and admits them (bounded by
+N and by physical RAM), asks the registry's `pick()` which conversation runs next, hands the session
+over if that is a different one, and runs **one** step - one prompt segment, or one verify window -
+before choosing again. A step is the pre-emption point, so a 36 k-token read no longer blocks
+everything: its chunks interleave with another conversation's windows. `--starve-ms` (default 250)
+is the fairness bound that forces a hand-over; the default is to *stay* on the mounted slot, because
+a hand-over is a save+restore of the whole conversation. A decode step is one verify window unless
+`--decode-tokens N` makes it a turn of N tokens - see the flag above.
+
+What that buys, and what it does not: the GPU is still serialised (one engine thread issues windows -
+the doorbell/pool handshake forbids two), so two conversations share it rather than doubling it. The
+win is latency and the fixed cost of prompt reads, not throughput per token.
+
+Three resources are still **one per process**, and the driver treats them as acquired resources
+rather than assumptions:
+
+* the **prompt loan** (the tail slots of each stage's expert cache). One owner at a time; a second
+  prefill that wants it is *deferred* and served after, and a verify window never runs over a lent
+  cache;
+* the **M-RoPE position table** (`d_mrope`). In this release an image request (`GENI`) runs alone:
+  admission will not bring a second conversation in while one holds non-identity positions, nor an
+  image request while anything else runs;
+* the **watchdog**. It used to abort the process when the single request stopped beating. It now
+  watches every active slot separately: a slot that stalls alone gets `ERR <id>` and its slot is
+  destroyed, and the engine aborts only when *every* watched slot stalled - and says which ones.
+
+`--serve-slots >= 2` is **refused at startup** when parking is off (`--prompt-cache 0`,
+`--conversation-cache-mib 0`, `--conversation-cache-slots 0`) or when the machine-sized default
+budget resolves to 0: a slot switch *is* a save/restore, so without somewhere to park a conversation
+"two slots" would mean two conversations overwriting one session. A request that cannot be admitted
+gets `ERR <id>` and the process stays up.
+
 The engine log reports parking, restoration, bytes, evictions, individual snapshot
 sizes and K/V bytes reused during capture. `STRATA_SNAPSHOT_FULL_CAPTURE=1` disables
 retention for diagnostic comparisons. Snapshots are not
 persisted across restarts.
 
-**Current limits (v1):** one request at a time, and one conversation cached at a time (switching between two chats
-re-reads the other one unless the opt-in cache above is enabled); images only when set up with them (below); no video. **Temperature / top_p / top_k / min_p /
+**Current limits (v1):** `--serve-slots >= 2` runs several conversations at once inside one process
+(above), but the GPU is still serialised - one engine thread, one step at a time - so it is latency
+and prompt fixed cost that improve, not tokens per second; an image request runs alone; with the
+default `--serve-slots 0` requests are still served strictly one at a time, byte-identically to
+0.1.30; one conversation cached live, plus up to eight parked prompts in the cache above,
+which prune the one used least recently first - with parking's budget at 0, switching between two chats
+re-reads the other one; parking covers a `--layer-split` (multi-GPU) as well as one GPU, but a parked
+conversation belongs to the split it was captured from, so changing `--layer-split` drops the parked
+ones rather than mounting them into a different layer layout; images only when set up with them (below); no video. **Temperature / top_p / top_k / min_p /
 seed** are honored per request (OpenAI and Anthropic fields); with the default adaptive expert tier a sampled result
 is not reproducible run to run - for seed-reproducible output add `--adapt-every 100000` (static residency) to the
 engine arguments. The run config's optional `sampling` block sets the defaults for requests that leave the fields out

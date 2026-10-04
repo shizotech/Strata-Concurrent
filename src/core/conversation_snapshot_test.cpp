@@ -193,6 +193,112 @@ void full_session(int fmt, int mode, int experts) {
     check(spare==a.checkpoints[0].dead,"checkpoint rebuilds spare row over a later completed block");
     check(ss.ple_prev[0]==2 && ss.ple_prev[1]==3,"checkpoint PLE token window");
 }
+
+// S3.1a on a device: park and mount a conversation that spans a two-way layer split.  Each
+// stage's session owns only its layer carve, so the image must carry BOTH stages' running state
+// and K/V plus the draft's, and a mount must put every one of them back byte-exactly.  The
+// fixture keeps one device (what a CI box has); what it exercises is the carve, the stage parts
+// and the per-stage order - which is exactly what a real split changes.
+void split_session(int fmt, int mode, int experts) {
+    Fixture main(fmt,mode), stage(fmt,mode), draft(fmt==3?kKvInt8:fmt,2);
+    auto& g=main.g;
+    g.n_layers=8; g.n_expert=experts;
+    g.ssm_state_size=2; g.ssm_v_heads=2; g.ssm_conv_channels=8;
+    // n_head_kv/head_dim/idx_key_dim stay at ModelGeometry's defaults: Fixture sized its pools from them.
+    // stage 0 is CUDA0's session [0,4): QSA ordinal 0, GDN rows 0..2.  stage 1 is [4,8): ordinal 1, rows 3..5.
+    SessionState ss, st1;
+    ss.max_cells=96; st1.max_cells=96;
+    ss.layer_lo=0; ss.layer_hi=4; ss.qsa_ord0=0; ss.qsa_alloc=1; ss.gdn_ord0=0; ss.gdn_alloc=3;
+    st1.layer_lo=4; st1.layer_hi=8; st1.qsa_ord0=1; st1.qsa_alloc=1; st1.gdn_ord0=3; st1.gdn_alloc=3;
+    std::string err;
+    ConversationStateSizes whole;
+    check(conversation_state_sizes(g,whole,err),"split geometry sizes");
+    const size_t gdn_rows = whole.gdn / (size_t) g.n_gdn_layers();
+    main.alloc(ss.gdn_state,gdn_rows*3); main.alloc(ss.ple_hist,whole.ple);
+    stage.alloc(st1.gdn_state,gdn_rows*3); stage.alloc(st1.ple_hist,whole.ple);
+    for (auto* f : {&main,&stage}) {
+        f->alloc(f->state.idx_tail,whole.tail); f->alloc(f->state.idx_dead,whole.dead);
+        f->alloc(f->state.idx_block_pos,whole.block_pos);
+    }
+    // session_init allocates the whole n_qsa_layers array and initializes only the range's
+    // ordinals; the rest stay nulls a snapshot must never read.  The array is GLOBAL-indexed,
+    // which is the whole point of the carve, so stage 0 owns ordinal 0 and stage 1 ordinal 1.
+    std::array<QsaState,2> main_layers{main.state, QsaState{}}, stage_layers{QsaState{}, stage.state};
+    ss.qsa_states=main_layers.data(); st1.qsa_states=stage_layers.data();
+    std::vector<int32_t> ids(65);
+    for (size_t i=0;i<ids.size();++i) ids[i]=(int32_t)i+1;
+    std::vector<ConversationImageKey> images;
+    std::vector<ConversationCheckpoint> checkpoints;
+    auto fill=[&](uint8_t salt) {
+        main.fill(salt); stage.fill(salt); draft.fill(salt);
+        for (const auto& [p,n] : std::vector<std::pair<void*,size_t>>{
+                 {ss.gdn_state,gdn_rows*3},{ss.ple_hist,whole.ple},{st1.gdn_state,gdn_rows*3},{st1.ple_hist,whole.ple},
+                 {main.state.idx_tail,whole.tail},{main.state.idx_dead,whole.dead},{main.state.idx_block_pos,whole.block_pos},
+                 {stage.state.idx_tail,whole.tail},{stage.state.idx_dead,whole.dead},{stage.state.idx_block_pos,whole.block_pos}})
+            cuda_check(cudaMemset(p,salt,n));
+        // A real indexer maintains its spare pooled row as a copy of idx_dead.
+        for (auto* f : {&main,&stage})
+            cuda_check(cudaMemcpy(f->state.idx_pooled+(ids.size()/4)*g.idx_key_dim,
+                                  f->state.idx_dead,whole.dead,cudaMemcpyDeviceToDevice));
+        cuda_check(cudaDeviceSynchronize());
+    };
+    fill(13);
+    // The checkpoint chain's parts: CUDA0's state plus one part per later stage, exactly the shape
+    // generate.cpp's on_stage_chunk / checkpoint_at build on a split.
+    ConversationCheckpoint checkpoint;
+    checkpoint.ids.assign(ids.begin(),ids.begin()+3);
+    check(conversation_checkpoint_save(checkpoint,ss,g,err),"split: save CUDA0's checkpoint part");
+    {
+        ConversationCheckpoint part;
+        part.ids = checkpoint.ids;
+        check(conversation_checkpoint_save(part,st1,g,err),"split: save the later stage's checkpoint part");
+        checkpoint.stage_parts.push_back(std::move(part));
+    }
+    checkpoint.used = 17;
+    checkpoints.push_back(std::move(checkpoint));
+    const ConversationView view{ids,images,checkpoints,true};
+    const ConversationStage stage_list[]{ {&st1, -1} };
+    const ConversationStageSet stages{stage_list, 1, -1, -1};
+    SavedConversation a,b,restored;
+    check(conversation_snapshot_save(a,view,ss,stages,g,draft.state,err),"split: capture complete A");
+    check(a.stage_parts.size()==1 && a.stage_parts[0].layer_lo==4 && a.stage_parts[0].layer_hi==8,
+          "split capture records the later stage's carve");
+    check(a.stage_parts[0].kv.size()==1 && a.kv.size()==2,"split capture: stage K/V stays separate from the draft's");
+    check(a.checkpoints[0].stage_parts.size()==1,"split capture keeps the checkpoint chain's stage parts");
+    check(a.live.stage_parts.empty(),"a parked image keeps its stage state in stage_parts");
+    fill(177);
+    check(conversation_snapshot_save(b,view,ss,stages,g,draft.state,err),"split: capture complete B");
+    check(a.stage_parts[0].state.dead!=b.stage_parts[0].state.dead,"different opening stage state in the fixture");
+    auto bad=a; bad.stage_parts[0].kv[0].k.pop_back();
+    check(conversation_snapshot_restore(bad,ss,stages,g,draft.state,err)==ConversationRestore::invalid,
+          "split: corrupt stage K/V rejected before any write");
+    auto bad2=a; bad2.stage_parts[0].state.gdn.pop_back();
+    check(conversation_snapshot_restore(bad2,ss,stages,g,draft.state,err)==ConversationRestore::invalid,
+          "split: corrupt stage running state rejected before any write");
+    check(conversation_snapshot_save(restored,view,ss,stages,g,draft.state,err),"split: capture B after refused restores");
+    check(restored.stage_parts[0].state.dead==b.stage_parts[0].state.dead &&
+          equal(restored.stage_parts[0].kv[0],b.stage_parts[0].kv[0]),"refused split restores preserve the stage state");
+    check(conversation_snapshot_restore(a,ss,stages,g,draft.state,err)==ConversationRestore::restored,"split: restore A");
+    check(conversation_snapshot_save(restored,view,ss,stages,g,draft.state,err),"split: capture restored A");
+    check(restored.live.gdn==a.live.gdn && restored.live.ple==a.live.ple && restored.live.dead==a.live.dead &&
+          equal(restored.kv[0],a.kv[0]) && equal(restored.kv[1],a.kv[1]),
+          "split A/B/A exactness for CUDA0's session and the draft");
+    check(restored.stage_parts[0].state.gdn==a.stage_parts[0].state.gdn &&
+          restored.stage_parts[0].state.ple==a.stage_parts[0].state.ple &&
+          restored.stage_parts[0].state.tails==a.stage_parts[0].state.tails &&
+          restored.stage_parts[0].state.dead==a.stage_parts[0].state.dead &&
+          restored.stage_parts[0].state.block_pos==a.stage_parts[0].state.block_pos &&
+          equal(restored.stage_parts[0].kv[0],a.stage_parts[0].kv[0]),
+          "split A/B/A exactness for the later stage");
+    check(ss.ple_prev[0]==64 && ss.ple_prev[1]==65,"split: PLE token window reconstructed");
+    check(conversation_checkpoint_restore(a.checkpoints[0],ss,g,err),"split: restore the early checkpoint");
+    check(a.checkpoints[0].stage_parts.size()==1 &&
+          conversation_checkpoint_restore(a.checkpoints[0].stage_parts[0],st1,g,err),
+          "split: restore the early checkpoint's stage part");
+    std::vector<uint8_t> spare(whole.dead);
+    cuda_check(cudaMemcpy(spare.data(),stage.state.idx_pooled,whole.dead,cudaMemcpyDeviceToHost));
+    check(spare==a.checkpoints[0].stage_parts[0].dead,"split: a stage checkpoint rebuilds its spare row");
+}
 }
 
 int main() {
@@ -265,8 +371,10 @@ int main() {
             }
         }
     }
-    for (int fmt : {kKvF16,kKvInt8,kKvQ4}) for (int mode : {0,1}) for (int experts : {256,512})
+    for (int fmt : {kKvF16,kKvInt8,kKvQ4}) for (int mode : {0,1}) for (int experts : {256,512}) {
         full_session(fmt,mode,experts);
-    for (int experts : {256,512}) full_session(3,0,experts);
+        split_session(fmt,mode,experts);
+    }
+    for (int experts : {256,512}) { full_session(3,0,experts); split_session(3,0,experts); }
     std::printf("conversation_snapshot_test: %d checks passed\n",checks);
 }

@@ -1,0 +1,1 @@
+cd /ssd/Strata; echo "=== step_gate called in the driver? ==="; grep -n "step_gate(" src/program/generate.cpp; echo; echo "=== force_reread called? ==="; grep -n "force_reread(" src/program/generate.cpp; echo; echo "=== park_guard called in swap_to? ==="; grep -n "park_guard" src/program/generate.cpp | head -8

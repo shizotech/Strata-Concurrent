@@ -1,0 +1,1 @@
+cd /ssd/Strata; sed -n '370,400p' include/strata/program/serve_driver.hpp; echo "=== budget_of / budget_has_room ==="; sed -n "/^inline Budget budget_of/,/^}/p;/^inline bool budget_has_room/,/^}/p" include/strata/program/serve_swap.hpp

@@ -1,0 +1,1 @@
+cd /ssd/Strata && git diff --stat include/strata/core/mtp.hpp src/core/mtp.cpp && echo "--- only these two source files changed by this task ---" && ls .megamind/src/core/s434-mtp-kv-only-notes.md .shz_cmd/s434_*.cpp

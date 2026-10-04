@@ -1,0 +1,1 @@
+cd /ssd/Strata && g++ -std=c++20 -Wall -Wextra -Wshadow -Iinclude -o /tmp/pst_warn src/program/prefill_svc_test.cpp 2>&1 | grep -v sframe | head -20; echo "WARN_BUILD_DONE"; /tmp/pst_warn | tail -1; wc -l include/strata/program/prefill_svc.hpp src/program/prefill_svc_test.cpp

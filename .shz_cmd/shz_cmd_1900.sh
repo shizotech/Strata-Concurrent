@@ -1,0 +1,1 @@
+echo "=== is MY test engine gone? ==="; pgrep -af "conversation-cache-mib 2048" || echo "gone (killed)"; echo; echo "=== what remains — is this yours? ==="; pgrep -af "strata --serve"; echo; for p in 1663746 1764902; do printf "original pid %s: " $p; [ -d /proc/$p ] && echo ALIVE || echo "gone"; done

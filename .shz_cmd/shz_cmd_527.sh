@@ -1,0 +1,1 @@
+cd /ssd/Strata && git status --porcelain | grep "^??" | grep -E "conversation_wire|saved_conv_wire|handoff" ; echo "--- modified by me? ---"; git status --porcelain | grep -E "conversation_wire|saved_conv_wire"; echo "(empty above = only new files)"; ls -la include/strata/core/conversation_wire.hpp src/core/conversation_wire.cpp src/core/saved_conv_wire_test.cpp

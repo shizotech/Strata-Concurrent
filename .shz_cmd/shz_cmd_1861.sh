@@ -1,0 +1,1 @@
+cd /ssd/Strata; echo "=== S3.6 additions in generate.cpp ==="; grep -n "S3.6" src/program/generate.cpp | head -20; echo; echo "=== definitions ==="; grep -n "auto force_reread\|auto park_guard\|auto step_gate\|auto note_resumed\|auto note_reread" src/program/generate.cpp

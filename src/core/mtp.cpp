@@ -236,61 +236,90 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     vram_ += sb;
 
     // ---- buffers
+    // S4.3.4: in KV-only mode (`bind_kv_only` ran before this `load`) the buffers only a DRAFT pass touches are
+    // not allocated at all.  The split below is exactly `record_forward`'s: everything it writes or reads before
+    // its `if (!full) return true;` (the K/V append) is carved unconditionally; everything after that line - the
+    // attention read, the MLP hyper-connection, the MoE, the mixer, the head and the sampler - is inside
+    // `if (!kv)`.  `draft_only_bytes_` records the difference, so the saving is computed from the code.
     window_ = (window > 0 && window < max_cells) ? window : 0;
     cap_ = (((window_ > 0 ? window_ : max_cells) + 63) / 64) * 64;
     attn_scratch_floats_ = (int64_t) strata::kernels::qsa_decode_attn_scratch_floats(cap_, s);
     const uint64_t T = (uint64_t) max_t, N = (uint64_t) g.n_embd, HC = (uint64_t) g.hc, K = (uint64_t) ss.k;
     const uint64_t NH = (uint64_t) g.n_head, HD = (uint64_t) g.head_dim, NKV = (uint64_t) g.n_head_kv;
     const uint64_t R2 = 2 * T;   // step/pos rows: T catch-up rows + up to T-2 chain steps
+    // mapped staging: the prompt path stages tokens / step records / positions; the row selector, the draft out
+    // and the draft probabilities belong to a draft round.
     bool ok = mapped(T * 4 + 64, (void**) &h_tok_, (void**) &m_tok_) &&
               mapped(R2 * 4 * 4 + 64, (void**) &h_step_, (void**) &m_step_) &&
-              mapped(R2 * NH * 4 + 64, (void**) &h_pos_, (void**) &m_pos_) &&
-              mapped(64, (void**) &h_row_, (void**) &m_row_) &&
-              mapped(T * 4 + 64, (void**) &h_out_, (void**) &m_out_) &&
-              mapped(T * 4 + 64, (void**) &h_prob_, (void**) &m_prob_);
+              mapped(R2 * NH * 4 + 64, (void**) &h_pos_, (void**) &m_pos_);
+    if (ok && !kv_only_)
+        ok = mapped(64, (void**) &h_row_, (void**) &m_row_) &&
+             mapped(T * 4 + 64, (void**) &h_out_, (void**) &m_out_) &&
+             mapped(T * 4 + 64, (void**) &h_prob_, (void**) &m_prob_);
     if (!ok) { err = "mtp: mapped staging failed"; return false; }
-    auto carve = [&](Bump& b) {
-        tok_ = b.take<int32_t>(T); step_ = b.take<int32_t>(R2 * 4); pos_ = b.take<int32_t>(R2 * NH); row_ = b.take<int32_t>(4);
-        ident_ = b.take<int32_t>(T * (uint64_t) cap_);
+    // what a prompt read writes into, and what only a draft round touches (see the comment above `window_`).
+    // `R_` is on the prompt side: `add_streams_broadcast` writes it and the attention hyper-connection reads it
+    // before `record_forward`'s `if (!full) return true;`.  The ORDER below is the original one, so in full mode
+    // every buffer keeps exactly the offset it had before S4.3.4; KV-only mode only skips the guarded rows.
+    auto carve = [&](Bump& b, bool kv) {
+        tok_ = b.take<int32_t>(T); step_ = b.take<int32_t>(R2 * 4); pos_ = b.take<int32_t>(R2 * NH);
+        if (!kv) { row_ = b.take<int32_t>(4); ident_ = b.take<int32_t>(T * (uint64_t) cap_); }
         Rin_ = b.take<float>(T * HC * N); R_ = b.take<float>(T * HC * N);
         emb_ = b.take<float>(T * N); en_ = b.take<float>(T * N); e2_ = b.take<float>(T * N);
         hn_ = b.take<float>(T * HC * N); h2_ = b.take<float>(T * HC * N);
-        mixed_ = b.take<float>(T * N); inj_ = b.take<float>(T * HC); inj2_ = b.take<float>(T * HC);
-        lo_ = b.take<float>(T * (uint64_t) g.hc_lr); rs_ = b.take<float>(T * HC); bo_ = b.take<float>(T * N);
+        mixed_ = b.take<float>(T * N); inj_ = b.take<float>(T * HC);
+        if (!kv) inj2_ = b.take<float>(T * HC);
+        lo_ = b.take<float>(T * (uint64_t) g.hc_lr); rs_ = b.take<float>(T * HC);
+        if (!kv) bo_ = b.take<float>(T * N);
         xn_ = b.take<float>(T * HC * N);
         xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes((int) (NH * HD), 8));
-        qfull_ = b.take<float>(T * NH * 2 * HD); qcur_ = b.take<float>(T * NH * HD);
+        if (!kv) { qfull_ = b.take<float>(T * NH * 2 * HD); qcur_ = b.take<float>(T * NH * HD); }
         kcur_ = b.take<float>(T * NKV * HD); vcur_ = b.take<float>(T * NKV * HD);
-        attn_ = b.take<float>(T * NH * HD); attn32_ = b.take<float>(T * NH * HD);
-        attn_scratch_ = b.take<float>((uint64_t) attn_scratch_floats_);   // the full layer runs one row at a time
-        logits_ = b.take<float>(T * (uint64_t) g.n_expert); w_ = b.take<float>(T * K); ids_ = b.take<int32_t>(T * K);
-        shared_ = b.take<float>(T * N); parts_ = b.take<float>(T * K * N); y_ = b.take<float>(T * N);
-        sample_ = b.take<float>(T * N);
-        hit_slot_ = b.take<int32_t>(T * K); hit_dst_ = b.take<int32_t>(T * K); hit_count_ = b.take<int32_t>(4);
-        grp_ptr_ = b.take<unsigned long long>(T * K); grp_start_ = b.take<int32_t>(T * K + 1);
-        grp_counts_ = b.take<int32_t>(4);
-        hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34); hit_xs_ = b.take<float>(T * (N / 32));
-        hit_scratch_ = b.take<uint8_t>(strata::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff));
-        sh_scratch_ = (float*) b.take<uint8_t>(strata::kernels::shared_expert_scratch_bytes(g.n_ff));
-        x_bf16_ = b.take<uint16_t>(N);
-        out_ids_ = b.take<int32_t>(T + 4);
-        probs_ = b.take<float>(T + 4);
-        dummy_inj_ = b.take<float>(HC);
+        if (!kv) {
+            attn_ = b.take<float>(T * NH * HD); attn32_ = b.take<float>(T * NH * HD);
+            attn_scratch_ = b.take<float>((uint64_t) attn_scratch_floats_);   // the full layer runs one row at a time
+            logits_ = b.take<float>(T * (uint64_t) g.n_expert); w_ = b.take<float>(T * K); ids_ = b.take<int32_t>(T * K);
+            shared_ = b.take<float>(T * N); parts_ = b.take<float>(T * K * N); y_ = b.take<float>(T * N);
+            sample_ = b.take<float>(T * N);
+            hit_slot_ = b.take<int32_t>(T * K); hit_dst_ = b.take<int32_t>(T * K); hit_count_ = b.take<int32_t>(4);
+            grp_ptr_ = b.take<unsigned long long>(T * K); grp_start_ = b.take<int32_t>(T * K + 1);
+            grp_counts_ = b.take<int32_t>(4);
+            hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34); hit_xs_ = b.take<float>(T * (N / 32));
+            hit_scratch_ = b.take<uint8_t>(strata::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff));
+            sh_scratch_ = (float*) b.take<uint8_t>(strata::kernels::shared_expert_scratch_bytes(g.n_ff));
+            x_bf16_ = b.take<uint16_t>(N);
+            out_ids_ = b.take<int32_t>(T + 4);
+            probs_ = b.take<float>(T + 4);
+            dummy_inj_ = b.take<float>(HC);
+        }
     };
     Bump count;
-    carve(count);
+    carve(count, kv_only_);
+    // What the mode skips: the same carve with the guards open, minus the KV-only carve.  Computed from the
+    // code, never guessed, and printed by `load()` when the mode is on.  (The pointer assignments the pricing
+    // carves make are overwritten by the real carve below; nothing is dereferenced here.)
+    {
+        Bump full, only;
+        carve(full, false);
+        carve(only, true);
+        draft_only_bytes_ = full.used - only.used;
+    }
     if (cudaMalloc(&arena_, count.used) != cudaSuccess) { err = "mtp: buffers do not fit"; return false; }
     cudaMemset(arena_, 0, count.used);
     Bump real;
     real.base = (uint8_t*) arena_;
-    carve(real);
+    carve(real, kv_only_);
     vram_ += count.used;
-    {
+    if (ident_ != nullptr) {   // the identity index feeds the draft path's attention read only
         std::vector<int32_t> id((size_t) (T * (uint64_t) cap_));
         for (uint64_t t = 0; t < T; ++t)
             for (int64_t i = 0; i < cap_; ++i) id[(size_t) (t * (uint64_t) cap_ + (uint64_t) i)] = (int32_t) i;
         cudaMemcpy(ident_, id.data(), id.size() * 4, cudaMemcpyHostToDevice);
     }
+    if (kv_only_)
+        std::fprintf(stderr, "strata mtp: KV-ONLY mode (S4.3.4): prompt K/V only, no drafting; %llu B of draft-only "
+                             "buffers not allocated (%.1f MiB)\n",
+                     (unsigned long long) draft_only_bytes_, (double) draft_only_bytes_ / 1048576.0);
     if (cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess) { err = "mtp: stream"; return false; }
     const double files_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_files).count();
     std::fprintf(stderr, "strata mtp: draft layer loaded, %.0f MiB of VRAM (experts %.0f, dense %.0f), files read in %.2f s (%.0f MiB/s)\n",
@@ -301,7 +330,12 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     return true;
 }
 
+uint64_t MtpDrafter::draft_only_bytes() const { return draft_only_bytes_; }
+
 uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const {
+    // S4.3.4: KV-only mode binds nothing, so it reserves nothing.  The expert cache is sized from this number
+    // (`src/program/generate.cpp`, the `mtp_bind` term), so a prefill role gets its ~578 MiB back as cache slots.
+    if (kv_only_) return 0;
     uint64_t bytes = head_logits_ ? 0 : (uint64_t) max_t_ * (uint64_t) n_vocab * sizeof(float);
     if (dhead_ == nullptr) {
         if (FILE* f = std::fopen((rt_dir_ + "/draft_vocab.bin").c_str(), "rb")) {
@@ -360,6 +394,10 @@ bool MtpDrafter::setup_coupled(std::string& err) {
 }
 
 void MtpDrafter::set_draft_sampling(const strata::kernels::SamplerParams& sp) {
+    // S4.3.4: KV-only mode never drafted, so it never has the coupled sampler (`setup_coupled` is part of
+    // `bind()`).  `coupled_ok_` is already false there; saying so explicitly keeps a caller that hands the
+    // prefill role a request's sampling parameters from ever reaching `*h_cparams_`, which is null in this mode.
+    if (kv_only_) { coupled_active_ = false; return; }
     coupled_active_ = coupled_ok_ && !sp.greedy && sp.temperature > 0.0f;
     if (!coupled_active_) return;
     *h_cparams_ = sp;   // read by the next round graph (after the previous one has synced)
@@ -374,6 +412,10 @@ void MtpDrafter::set_draft_history(const int32_t* tail, int64_t n_tail, int32_t 
 
 bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err) {
     const OnDevice on_device(device_);
+    // S4.3.4 guard: a drafter declared KV-only never becomes a drafting drafter behind its owner's back.  The
+    // prefill role's whole contract (docs/STAGE4-SPLIT-ROLES.md §1.4) is that it appends K/V and does not draft;
+    // silently upgrading it would run draft graphs over buffers `load()` chose not to allocate.
+    if (kv_only_) { err = "mtp: this drafter is bound KV-only (bind_kv_only); it cannot be bound for drafting"; return false; }
     wt_ = &wt;
     head_ = head;
     window_R_ = window_R;
@@ -409,13 +451,81 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
     return true;
 }
 
+// S4.3.4 - the KV-only bind (docs/STAGE4-SPLIT-ROLES.md §1.4, OQ-S4-9).
+//
+// A `--role prefill` instance must still write the draft layer's K/V for every prompt token, because that K/V is
+// part of the handoff payload (`SavedConversation::kv` = "main layers followed by the draft layer",
+// include/strata/core/conversation_cache.hpp:131) and the prompt path is the only thing that produces it
+// (`sp.on_chunk` -> `Prefill::draft_kv` / `MtpDrafter::prefill`).  But it must never DRAFT, and it must not pay
+// for what only drafting needs.
+//
+// What the prompt path actually touches is exactly what `record_forward` reaches before its
+// `if (!full) return true;`: `wt_->find("token_embd.weight")` (or `native_embed()`), the rt/ dense tensors
+// (`f32`/`bf16`/`q8`), `tok_`/`step_`/`pos_` + their mapped staging, `Rin_`, and the K/V state `st_`.  So this
+// sets `wt_` and the mode flag and allocates nothing at all:
+//   * no `head_` (and therefore no `NativeHead` in the prefill role - the 497 MiB of OQ-S4-9),
+//   * no `window_R_` (the verifier's `final_R_all()`, which a prefill instance does not build),
+//   * no `head_logits_`, no `dhead_`/`dvocab_` (the 81.2 MiB draft head, `strata-iq3_s.log:35`),
+//   * no `setup_coupled` (the coupled draft sampler),
+//   * and, when `load()` runs after this, none of the draft-only buffers (`draft_only_bytes()`).
+// Order with `load()` does not matter: this never reads `max_t_`, and `load()` reads `kv_only_` when it carves.
+bool MtpDrafter::bind_kv_only(const WeightTable& wt, std::string& err) {
+    const OnDevice on_device(device_);
+    // A drafter already bound for drafting has its buffers - including the draft-only ones - allocated and its
+    // graphs possibly captured.  Downgrading it mid-life is not a supported transition; the role is decided at
+    // start-up.
+    if (head_ != nullptr) { err = "mtp: this drafter is already bound for drafting (bind); it cannot be downgraded to KV-only"; return false; }
+    // The same table lookup `bind()` does.  `n_vocab_` is not needed by the prompt path (it feeds the draft
+    // head), but reading it here means the mode refuses a table that is not the model's, instead of failing
+    // later inside a graph.
+    const WeightRef* wo = wt.find("output.weight");
+    if (!wo) { err = "mtp: output.weight is missing"; return false; }
+    n_vocab_ = wo->ne1;
+    wt_ = &wt;
+    kv_only_ = true;
+    head_ = nullptr;
+    window_R_ = nullptr;
+    coupled_ok_ = false;
+    coupled_active_ = false;
+    coupled_rec_ = false;
+    std::fprintf(stderr, "strata mtp: bound KV-ONLY: prompt draft K/V only, no draft head, no draft logits, "
+                         "no coupled sampler, no drafting\n");
+    return true;
+}
+
+// KV-only mode's answer to a draft call: not an assert, not uninitialised state, and not a token.
+//
+// It does three things, in this order:
+//   * zeroes every output slot the caller owns (`drafts`/`probs`, the same `max_t_ - 1` span `draft`'s own
+//     tail-clearing loop writes), so a caller that IGNORES the return value still reads "no drafts" instead of
+//     garbage from a buffer that was never allocated;
+//   * reports `*n_drafts = 0` when the caller asked for a count;
+//   * names the reason in `err` and returns FALSE, so a caller that DOES check - which is every caller in
+//     `src/program/generate.cpp` (`if (!drafted) { …; return Step::error; }`) - ends the request loudly instead
+//     of verifying a window of zero tokens.  A silent "success with nothing to say" would be the plausible-but-
+//     wrong outcome this mode exists to prevent.
+bool MtpDrafter::refuse_draft(int T, int32_t* drafts, float* probs, int* n_drafts, std::string& err) {
+    err = draft_refusal_reason();
+    // `max_t_ - 1` is the caller's own span (the engine sizes `drafts`/`probs` to the window, `o.spec` = max_t);
+    // before `load()` it is 0 and nothing is written.
+    for (int i = 0; i < max_t_ - 1; ++i) { if (drafts) drafts[i] = 0; if (probs) probs[i] = 0.0f; }
+    if (n_drafts) *n_drafts = 0;
+    (void) T;
+    ++draft_refusals_;
+    return false;   // always false: a draft round never "succeeded"
+}
+
 // The layer for T rows.  full = false stops after the K/V append (the prompt only needs the cache).
 bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::string& err) {
     using namespace strata::kernels;
-    const ModelGeometry& g = *g_;
-    SessionState& ss = *ss_;
     // step_row0 >= 0: the full layer on step rows [step_row0, +T); step_row0 < 0: K/V only on rows [-1 - step_row0, +T)
     const bool full = step_row0 >= 0;
+    // KV-only mode: the full layer (the draft round's forward) is refused HERE, not only at the public entry
+    // points, so no capture path can reach it - and it is refused BEFORE anything is dereferenced, so the refusal
+    // is total.  The K/V-only branch (`step_row0 < 0`) is exactly what the mode exists for and is untouched.
+    if (full && kv_only_) { err = draft_refusal_reason(); return false; }
+    const ModelGeometry& g = *g_;
+    SessionState& ss = *ss_;
     const int row0 = full ? step_row0 : -1 - step_row0;
     if (full && T != 1) { err = "mtp: the full layer runs one row at a time (its attention scratch is sized for one)"; return false; }
     const int64_t N = g.n_embd, HC = g.hc, K = ss.k, NH = g.n_head, HD = g.head_dim, NKV = g.n_head_kv;
@@ -616,6 +726,7 @@ bool MtpDrafter::capture_prefill_dev(int T, std::string& err) {
 }
 
 bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
+    if (kv_only_) { err = draft_refusal_reason(); return false; }   // S4.3.4: no draft graph is ever captured
     cudaGraphExec_t& exec = coupled ? round_exec_c_[T] : round_exec_[T];
     if (exec) return true;
     using namespace strata::kernels;
@@ -650,6 +761,7 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
 // Chain step j (1..max_t-2): one row at the cell staged in step row `max_t + j - 1`, from the previous step's
 // residual and token (left in Rin_[0] / tok_[0] by mtp_select); draft j and its probability to the mapped outputs.
 bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
+    if (kv_only_) { err = draft_refusal_reason(); return false; }   // S4.3.4: no draft graph is ever captured
     cudaGraphExec_t& exec = coupled ? step_exec_c_[j] : step_exec_[j];
     if (exec) return true;
     using namespace strata::kernels;
@@ -678,6 +790,13 @@ void MtpDrafter::kv_restore(int64_t upto) {
 
 bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err) {
     const OnDevice on_device(device_);
+    // The one thing the mode must never lose: an unbound or unloaded drafter has no `wt_`/`g_`, and
+    // `record_forward` would read them through a null pointer.  This is also the guard that makes "the prefill
+    // role forgot bind_kv_only (or load)" a named run-time error instead of a crash.
+    if (g_ == nullptr || wt_ == nullptr) {
+        err = "mtp: the drafter is not ready for a prompt read (needs load() and bind or bind_kv_only)";
+        return false;
+    }
     const Clock::time_point t0 = Clock::now();
     const int64_t HCN = g_->hc * g_->n_embd;
     // cells the window can never reach again need no K/V
@@ -768,6 +887,10 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
 bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                        float* probs, float min_p, int* n_drafts) {
     const OnDevice on_device(device_);
+    // S4.3.4: in KV-only mode nothing here may run - `capture_round` would build a graph over buffers `load()`
+    // never allocated, and `h_out_`/`h_prob_` do not exist.  Report "no drafts" and fail: every caller in
+    // `src/program/generate.cpp` checks this return and ends the request with the named reason.
+    if (kv_only_) return refuse_draft(T, drafts, probs, n_drafts, err);
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
     const bool cp = coupled_active_;   // coupled draft sampling for this request: its own graphs
     if (!capture_round(T, cp, err)) return false;
@@ -822,6 +945,13 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
 bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
                              float* probs, float min_p, int* n_drafts) {
     const OnDevice on_device(device_);
+    // S4.3.4: refuse BEFORE staging into `window_R_`, which KV-only mode never has (it is the verifier's
+    // `final_R_all()`, passed to `bind()` and null here).  `draft` refuses too; this is the first thing the
+    // function touches, so the guard has to be here as well.
+    if (kv_only_) return refuse_draft(T, drafts, probs, n_drafts, err);
+    // `window_R_` is the verify window's residual buffer, handed over by `bind()`.  Without it there is nowhere to
+    // stage the first row - refuse rather than write through a null pointer.
+    if (window_R_ == nullptr) { err = "mtp: draft_first needs the verify window's residuals (bind's window_R)"; return false; }
     // row 0 is the real pair; rows 1.. repeat it and only write cells the next round overwrites
     const int64_t HCN = g_->hc * g_->n_embd;
     for (int t = 0; t < T; ++t)

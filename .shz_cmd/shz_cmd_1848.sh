@@ -1,0 +1,1 @@
+cd /ssd/Strata; grep -n "park_fits\|may_step\|save_is_mandatory\|Outgoing::" src/program/serve_swap_test.cpp | head -15; echo "=== test counts ==="; cd /tmp/s3build && ninja serve_swap_test serve_driver_test 2>&1 | grep -E "error" | head -5; ./serve_swap_test | tail -1; ./serve_driver_test | tail -1

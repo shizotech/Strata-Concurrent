@@ -1,0 +1,1 @@
+cd /ssd/Strata && ls -la .megamind/src/program/ | tail -10; echo "--- new files ---"; ls docs/STAGE4* 2>/dev/null; ls .megamind/src/kernels/ 2>/dev/null; echo "--- git status ---"; git status --porcelain | grep -i "s4\|stage4" 

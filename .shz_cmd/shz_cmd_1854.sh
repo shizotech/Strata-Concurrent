@@ -1,0 +1,1 @@
+cd /ssd/Strata; sed -n '80,100p' include/strata/core/conversation_snapshot.hpp; echo "=== park_current's own guard + size ==="; grep -n "exceeds available budget\|auto park_current" src/program/generate.cpp | head

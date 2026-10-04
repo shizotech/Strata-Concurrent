@@ -877,7 +877,7 @@ def build_engine_hip(gpu, llama) -> Path:
                  "-DCMAKE_PREFIX_PATH=" + ";".join([str(root), *libs]),
                  f"-DCMAKE_HIP_FLAGS=--rocm-path={root} --rocm-device-lib-path={bitcode}",
                  f"-DSTRATA_GGML_DIR={llama}"], None, "")
-    shutil.copy2(ROOT / "build-hip" / EXE, eng / EXE)
+    install_exe(ROOT / "build-hip" / EXE, eng / EXE)
     stamp.write_text(json.dumps({"source": "local-hip", "backend": "hip", "version": source_version(),
                                  "archs": [gpu["arch"]], "vision": "none", "lib_dirs": dirs, "src": src}, indent=1))
     ok(f"engine compiled: {eng / EXE}")
@@ -1132,6 +1132,76 @@ def source_hash(parts) -> str:
     return h.hexdigest()[:16]
 
 
+def install_exe(src: Path, dst: Path) -> None:
+    """Put a freshly compiled engine at `dst`.
+
+    NOT a plain `shutil.copy2`: `dst` is the file the running server is executing, and on POSIX
+    writing into a file that is being executed fails with ETXTBSY ("Text file busy"). A setup run
+    after a `git pull` therefore used to die at the last second, after the whole compile, with
+    `command failed`/an OSError and no hint about why - and the engine folder kept the OLD binary
+    while BUILD.json was never stamped, so the next run compiled all over again.
+
+    Renaming over the destination is the fix: `os.replace` swaps the directory entry, the running
+    process keeps its own (now unlinked) inode and finishes its requests on the binary it started
+    with, and the NEXT start gets the new one. Stage the copy inside the same directory first,
+    because rename is only atomic within one filesystem.
+    """
+    tmp = dst.with_name(dst.name + ".new")
+    shutil.copy2(src, tmp)
+    tmp.chmod(0o755)                                    # the copy is about to be an executable
+    try:
+        os.replace(tmp, dst)
+    except OSError as e:
+        tmp.unlink(missing_ok=True)
+        fail(f"could not install {dst.name}: {e}",
+             f"something still holds {dst} open; close it and run this again (the engine is already compiled)")
+
+
+# Engine flags setup can set.  They are engine ARGUMENTS (they go in the config's "args"), not
+# server settings, so they follow a different path through setup than --host/--api-key do.
+ENGINE_FLAGS = ("--serve-slots", "--conversation-cache-mib", "--starve-ms")
+
+
+def engine_supports(exe, flag: str) -> bool:
+    """Does this engine binary know `flag`?
+
+    A probe, deliberately NOT a version comparison: the stage-3 flags exist in a locally compiled
+    0.1.30 but not in the published 0.1.30, so BUILD.json's version cannot tell them apart and a
+    version gate would either block the new engine or crash the old one.  `--help` prints and
+    exits without loading a model, so asking the binary itself is cheap and always right.
+    """
+    try:
+        r = subprocess.run([str(exe), "--help"], capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return flag in (r.stdout or "") + (r.stderr or "")
+
+
+def set_engine_args(cfg: dict, wanted: dict) -> list:
+    """Set (or replace) engine flags in cfg["args"], creating them when absent.
+
+    Returns the flags this engine does NOT know, so the caller can say so instead of writing a
+    config the engine would refuse at start ("unknown argument: --serve-slots", which used to look
+    like setup had ignored the flag - it had, and now it does not).
+    """
+    args = list(cfg.get("args") or [])
+    refused = []
+    for flag, value in wanted.items():
+        if value is None:
+            continue
+        if not engine_supports(cfg.get("exe", ""), flag):
+            refused.append(flag)
+            continue
+        arg = f"{flag} {value}"
+        if flag in args:
+            args[args.index(flag) + 1] = str(value)
+        else:
+            args += [flag, str(value)]
+    if args != list(cfg.get("args") or []):
+        cfg["args"] = args
+    return refused
+
+
 def build_engine(gpu, vision, yes, llama) -> Path:
     """Compile the engine (and, for images, the encoder) for this GPU; the results go to engine/.  A compiled
     engine whose source files changed since (a `git pull`) is compiled again: only the changed files, a few minutes."""
@@ -1164,14 +1234,14 @@ def build_engine(gpu, vision, yes, llama) -> Path:
         cmake_build(ROOT, ROOT / "build", "strata",
                     ["-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_BUILD_TESTS=OFF", f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}",
                      f"-DCMAKE_CUDA_COMPILER={nvcc}", f"-DSTRATA_GGML_DIR={llama}"], vcvars, "build-strata.bat")
-        shutil.copy2(ROOT / "build" / EXE, eng / EXE)
+        install_exe(ROOT / "build" / EXE, eng / EXE)
     if not vision_ok:
         say("  Compiling the image encoder" + (" with CUDA (10-20 minutes, once) ..." if vision == "gpu" else " ..."))
         defs = [f"-DLLAMA_DIR={llama}", f"-DSTRATA_VISION_CUDA={'ON' if vision == 'gpu' else 'OFF'}"]
         if vision == "gpu":
             defs += [f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}", f"-DCMAKE_CUDA_COMPILER={nvcc}"]
         cmake_build(ROOT / "tools" / "vision", ROOT / "build-vision", "strata-vision", defs, vcvars, "build-vision.bat")
-        shutil.copy2(ROOT / "build-vision" / "bin" / VEXE, eng / VEXE)
+        install_exe(ROOT / "build-vision" / "bin" / VEXE, eng / VEXE)
     bindir = Path(nvcc).parent                            # the toolkit's own libraries (bin, bin/x64, lib64)
     dirs = [str(d) for d in (bindir, bindir / "x64", bindir.parent / "lib64") if d.is_dir()]
     stamp.write_text(json.dumps({"source": "local", "version": source_version(), "archs": archs,
@@ -1533,8 +1603,12 @@ def upgrade_config(cfg_path: Path, cfg: dict) -> dict:
 
 
 def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_browser=True, yes=False,
-          layer_split=None, keep=None) -> int:
-    """keep: settings given on this start that the model keeps from now on (--host, --api-key, --draft-vocab)."""
+          layer_split=None, keep=None, engine_flags=None) -> int:
+    """keep: settings given on this start that the model keeps from now on (--host, --api-key, --draft-vocab).
+    engine_flags: engine ARGUMENTS given on this start (--serve-slots, --conversation-cache-mib, --starve-ms).
+    They are saved into the config the same way `keep` is, because the engine reads them from the config's
+    "args" at every start - a flag that only reached step 7 would never be seen here (issue: a plain
+    `setup.py --serve-slots 3` returned at the "already installed" branch, before step 7 ever ran)."""
     cfg = upgrade_config(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
     missing = [p for p in [cfg["exe"], *[a for a in cfg["args"] if a.endswith(".gguf")]] if not Path(p).exists()]
     if missing:
@@ -1545,6 +1619,16 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
         cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
         ok("saved for this model: " + ", ".join("api key" if k == "api_key" else f"{k.replace('_', ' ')} {v}"
                                                 for k, v in keep.items()))
+    if engine_flags:
+        refused = set_engine_args(cfg, engine_flags)
+        if refused:
+            warn("this engine does not know " + ", ".join(refused) + ": they are not saved. "
+                 "Compile it first (setup.py --build) - the ready-made release does not have them")
+        else:
+            changed = [f"{k} {v}" for k, v in engine_flags.items() if v is not None]
+            if changed:
+                cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+                ok("engine arguments for this model: " + ", ".join(changed))
     cfg_path.touch()                                     # the most recently used model
     if "--mtp" in cfg["args"][:-1]:
         refresh_draft_vocab(Path(cfg["args"][cfg["args"].index("--mtp") + 1]), cfg.get("draft_vocab", "cjk"))
@@ -1715,10 +1799,23 @@ def resolve_rope(ctx: int, scaling, scale, trained: int = 262144):
 
 # ------------------------------------------------------------------------------------------------ main
 def main() -> int:
+
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--family", choices=list(FAMILIES), help="qwen = Qwen3.8-Flash-Next, swift = Swift 1.5")
     ap.add_argument("--model", choices=list(MODELS))
     ap.add_argument("--context", type=int)
+    ap.add_argument("--serve-slots", type=int, metavar="N",
+                    help="--serve: keep N conversations active in one engine at once (2-8; 0 or 1 = one at a "
+                         "time, exactly as before). Needs an engine compiled from this folder: the ready-made "
+                         "release does not have it")
+    ap.add_argument("--decode-tokens", type=int, metavar="N",
+                    help="How many tokens to decode during a run for concurrent requests before swapping.")
+    ap.add_argument("--conversation-cache-mib", type=int, metavar="N",
+                    help="the RAM budget for parked conversations, in MiB. --serve-slots >= 2 needs it: a "
+                         "conversation that is not running right now is saved there and mounted back")
+    ap.add_argument("--starve-ms", type=int, metavar="N",
+                    help="with --serve-slots >= 2: how long a conversation may wait for the engine before it "
+                         "is swapped in (default 250; 0 = never force a swap)")
     ap.add_argument("--rope-scaling", choices=["none", "linear", "yarn"],
                     help="the RoPE extension for a context past the model's trained 262144: linear (position "
                          "interpolation) or yarn - llama.cpp's types. Omitted with a scaled context, the setup "
@@ -1811,6 +1908,13 @@ def main() -> int:
     # on the first one alone unless given with --setup), --gpu N runs this start on one card; neither: the saved
     # choice, and asked once when the PC has cards that could share the model
     run_gpu = (parse_gpus(a.gpus, gpus()) if a.gpus else None) or a.gpu
+    # engine ARGUMENTS given on the command line.  These are NOT part of `keep`: `keep` writes server
+    # settings, and the engine's flags live in the config's "args" list, which start() applies through
+    # set_engine_args (it also refuses them for an engine that predates them).
+    engine_flags = {"--serve-slots": a.serve_slots, "--conversation-cache-mib": a.conversation_cache_mib,
+                    "--starve-ms": a.starve_ms, "--max-context": a.context, "--rope-scaling": a.rope_scaling, "--rope-scale": a.rope_scale,
+                    "--decode-tokens": a.decode_tokens}
+                    
     port = a.port or 8080                              # a new install's port (issue #32: --port for an existing one)
     if have and a.calibrate and not (a.setup or a.model or a.family or a.check):
         if not a.build:
@@ -1823,13 +1927,15 @@ def main() -> int:
             pick_cfg = have[int(ask("Tune which one?", [str(i) for i in range(1, len(have) + 1)], "1", a.yes)) - 1]
         calibrate_config(pick_cfg)
         return 0 if a.no_start else start(pick_cfg, a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
-                     keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab})
+                     keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab},
+                     engine_flags=engine_flags)
     if have and not (a.setup or a.model or a.family or a.check or a.no_start):
         if not a.build:
             update_installed_engine(a.prebuilt)
         if len(have) == 1:
             return start(have[0], a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
-                     keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab})
+                     keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab},
+                     engine_flags=engine_flags)
         say()
         for i, c in enumerate(have, 1):
             say(f"  {i}) {json.loads(c.read_text(encoding='utf-8-sig')).get('model_name', c.stem)}")
@@ -1837,7 +1943,8 @@ def main() -> int:
         pick = int(ask("Which one?", [str(i) for i in range(1, len(have) + 2)], "1", a.yes))
         if pick <= len(have):
             return start(have[pick - 1], a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
-                     keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab})
+                     keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab},
+                     engine_flags=engine_flags)
 
     # ---- 1. the PC
     step(1, "checking your PC")
@@ -1997,10 +2104,6 @@ def main() -> int:
     # not a fixed 90 GB (the 0.1.29 arithmetic): arena + the context's KV + 24 GB of room for everything else.
     asked_ctx = ctx
     need_gb = MODELS[model].get("arena_gb", 0) + ctx * 13 * 1056 / 1e9 + 24
-    if model in ("IQ3_XXS", "IQ3_S") and ram < need_gb and ctx > 131072:
-        warn(f"{model} with a {ctx // 1024}K context needs about {need_gb:.0f} GB of RAM "
-             f"({MODELS[model]['arena_gb']:.0f} GB of experts + the context + room for the rest): using 128K")
-        ctx = 131072
     scaling = a.rope_scaling
     if ctx > 262144 and scaling is None and not a.yes:
         # the interactive path: one question, yarn preselected (llama.cpp's extension method, recall-tested
@@ -2199,6 +2302,7 @@ def main() -> int:
     ok(f"MTP draft layer: {rt}")
 
     # ---- 7. the start script
+
     step(7, "writing the start script")
     sys.path.insert(0, str(ROOT / "tools"))
     from gguf_reader import GGUFFile                   # the PLE table's shard: shard 2 (original) or 1 (Swift)
@@ -2300,7 +2404,7 @@ def main() -> int:
         say("  Images:           send them in the chat page, in chat.py (/image <path>) or over the API")
     if a.no_start:
         return 0
-    return start(cfg_path, port)
+    return start(cfg_path, port, engine_flags=engine_flags)   # --setup: the flags land in the config too
 
 
 if __name__ == "__main__":

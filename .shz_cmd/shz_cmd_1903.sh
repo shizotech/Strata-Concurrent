@@ -1,0 +1,1 @@
+cd /ssd/Strata; sed -n "/the NEVER case/,/^}/p" include/strata/program/serve_driver.hpp | head -30; echo "=== ParkCeiling ==="; sed -n "/^struct ParkCeiling/,/^};/p" include/strata/program/serve_driver.hpp

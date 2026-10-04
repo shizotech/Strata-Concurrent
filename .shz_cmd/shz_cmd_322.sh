@@ -1,0 +1,1 @@
+cd /ssd/Strata && python -m pytest "serve/test_server.py::HeldInsteadOfRejected" -q -x --tb=line 2>&1 | tail -15; echo "=== ALL 6, line tb ==="; python -m pytest "serve/test_server.py::HeldInsteadOfRejected" -q --tb=line 2>&1 | grep -E "^serve/test_server.py|AssertionError|Error" | head -20

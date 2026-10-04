@@ -1,0 +1,1 @@
+cd /ssd/Strata; echo "=== does prep_request clear live_ok for the whole request? ==="; grep -n "live_ok = " src/program/generate.cpp | head -12; echo; echo "=== the comment claiming it ==="; grep -n "until this request has finished" -B 4 -A 2 src/program/generate.cpp | head -20

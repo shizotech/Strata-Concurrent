@@ -1,0 +1,1 @@
+echo "=== server.py processes ==="; pgrep -af "server.py" | head; echo; echo "=== listening sockets ==="; ss -ltn 2>/dev/null | head -8; echo; echo "=== engine 1791211 state ==="; grep -E "^State|^Name" /proc/1791211/status 2>/dev/null || echo "gone"

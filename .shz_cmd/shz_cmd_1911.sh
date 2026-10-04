@@ -1,0 +1,1 @@
+cd /ssd/Strata; ls -l --time-style=+'%H:%M' engine/strata build/strata; echo "on-disk has trace switch: $(./engine/strata --help 2>&1 | grep -c STRATA_SERVE_TRACE)"; echo "running server started 15:52, binary built 19:32 -> it runs the PRE-FIX inode"; readlink /proc/1791211/exe

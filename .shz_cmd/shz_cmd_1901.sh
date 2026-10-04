@@ -1,0 +1,1 @@
+echo "=== my test engine (2048) — must be gone ==="; pgrep -af "conversation-cache-mib 2048" || echo "GONE (killed)"; echo; echo "=== what is running now ==="; pgrep -af "strata --serve" | sed 's/--native.*--mtp/--<model args>--/' ; echo; grep MemAvailable /proc/meminfo | awk '{printf "MemAvailable: %.1f GiB\n", $2/1048576}'

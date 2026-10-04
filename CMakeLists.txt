@@ -651,6 +651,47 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   target_include_directories(bf16_bits_test PRIVATE include)
   add_test(NAME bf16_bits_test COMMAND bf16_bits_test)
 endif()
+if(STRATA_BUILD_TESTS)
+  # S0.3 prefill fixed-cost levers: the serve loop's loan/upload/parking decisions (header-only, no CUDA,
+  # no model).  See include/strata/program/prefill_loan.hpp.
+  add_executable(prefill_loan_test src/program/prefill_loan_test.cpp)
+  target_include_directories(prefill_loan_test PRIVATE include)
+  add_test(NAME prefill_loan_test COMMAND prefill_loan_test)
+endif()
+
+# ---- S3.1b + S3.1c (stage 3): the slot object / state machine / pick(), and the --serve wire format ----
+# Additive block, deliberately separate from the ones above so two agents' CMake edits merge cleanly.
+# Both are header-only decisions with no CUDA, no model and no I/O, exactly like prefill_loan_test: they
+# must build and run on a CPU-only machine.  See include/strata/program/slot.hpp and
+# include/strata/program/serve_proto.hpp.
+if(STRATA_BUILD_TESTS)
+  add_executable(slot_test src/program/slot_test.cpp)
+  target_include_directories(slot_test PRIVATE include)
+  add_test(NAME slot_test COMMAND slot_test)
+  add_executable(serve_proto_test src/program/serve_proto_test.cpp)
+  target_include_directories(serve_proto_test PRIVATE include)
+  add_test(NAME serve_proto_test COMMAND serve_proto_test)
+endif()
+
+# ---- S3.1d (stage 3): the slot mount/unmount ORDER and its decisions ------------------------------
+# Additive block, same reason as above: two agents' CMake edits must not collide.  Header-only, no
+# CUDA, no model - it links nothing but the conversation-cache header it asserts against.  See
+# include/strata/program/serve_swap.hpp.
+if(STRATA_BUILD_TESTS)
+  add_executable(serve_swap_test src/program/serve_swap_test.cpp)
+  target_include_directories(serve_swap_test PRIVATE include)
+  add_test(NAME serve_swap_test COMMAND serve_swap_test)
+endif()
+
+# ---- S3.1e-2 (stage 3): the concurrent driver's decisions -----------------------------------------
+# Additive block, same reason as above.  Header-only, no CUDA, no model: it is the part of the serve
+# driver loop that can be pinned without a GPU (admission, step dispatch, the prompt loan's owner,
+# the per-slot watchdog, cancel routing).  See include/strata/program/serve_driver.hpp.
+if(STRATA_BUILD_TESTS)
+  add_executable(serve_driver_test src/program/serve_driver_test.cpp)
+  target_include_directories(serve_driver_test PRIVATE include)
+  add_test(NAME serve_driver_test COMMAND serve_driver_test)
+endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
             src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp)
@@ -843,5 +884,62 @@ if(STRATA_BUILD_TESTS)
   # Model-level checks may be absent from source distributions.
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt")
     add_subdirectory(tests)
+  endif()
+endif()
+
+# ---- S4.3.1 / S4.3.2 / S4.3.3 (stage 4): the prefill/decode split's three new CPU-testable units ----
+# Additive blocks, same reason as the stage-3 ones above: two agents' CMake edits must not collide.
+# The parent owns this file for stage 4 — the S4.3 children must NOT edit CMakeLists.txt.  Each block is
+# guarded by `if(EXISTS ...)` so it is INERT until that step's sources land, which means the tree
+# configures and builds cleanly at every point in the sequence.  All three are CPU-only: no CUDA, no
+# model, no engine start.  See docs/STAGE4-SPLIT-ROLES.md §7 (the S4.3 plan) and
+# include/strata/core/conversation_wire.hpp, include/strata/core/handoff.hpp,
+# include/strata/program/prefill_svc.hpp.
+if(STRATA_BUILD_TESTS AND TARGET strata_engine)
+  # S4.3.1 — the payload codec: SavedConversation <-> a flat, hash-checked payload.  It links
+  # strata_engine because ConversationBuffer/ConversationKv live behind conversation_state.cpp.
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/core/conversation_wire.cpp")
+    add_library(strata_wire STATIC src/core/conversation_wire.cpp)
+    target_include_directories(strata_wire PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(strata_wire PUBLIC strata_engine)
+  endif()
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/core/saved_conv_wire_test.cpp")
+    add_executable(saved_conv_wire_test src/core/saved_conv_wire_test.cpp)
+    target_include_directories(saved_conv_wire_test PRIVATE include)
+    if(TARGET strata_wire)
+      target_link_libraries(saved_conv_wire_test PRIVATE strata_wire)
+    else()
+      target_link_libraries(saved_conv_wire_test PRIVATE strata_engine)
+    endif()
+    add_test(NAME saved_conv_wire_test COMMAND saved_conv_wire_test)
+    set_tests_properties(saved_conv_wire_test PROPERTIES TIMEOUT 120)
+  endif()
+
+  # S4.3.2 — the tmpfs handoff arena: header, slot table, FREE/CLAIMED/READY lifecycle, leases,
+  # statvfs sizing.  Cross-process cases re-exec the test binary with `--role`, exactly like
+  # pinned_shared_test does.
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/core/handoff.cpp")
+    add_library(strata_handoff STATIC src/core/handoff.cpp)
+    target_include_directories(strata_handoff PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(strata_handoff PUBLIC strata_core)
+  endif()
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/core/handoff_arena_test.cpp")
+    add_executable(handoff_arena_test src/core/handoff_arena_test.cpp)
+    target_include_directories(handoff_arena_test PRIVATE include)
+    if(TARGET strata_handoff)
+      target_link_libraries(handoff_arena_test PRIVATE strata_handoff)
+    endif()
+    target_link_libraries(handoff_arena_test PRIVATE strata_engine)
+    add_test(NAME handoff_arena_test COMMAND handoff_arena_test)
+    set_tests_properties(handoff_arena_test PROPERTIES TIMEOUT 180)
+  endif()
+
+  # S4.3.3 — the prefill<->decode control protocol: line grammar, the handoff state machine, the
+  # error-code -> serve_driver::Hold table.  Header-only decisions, links nothing.
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/program/prefill_svc_test.cpp")
+    add_executable(prefill_svc_test src/program/prefill_svc_test.cpp)
+    target_include_directories(prefill_svc_test PRIVATE include)
+    add_test(NAME prefill_svc_test COMMAND prefill_svc_test)
+    set_tests_properties(prefill_svc_test PROPERTIES TIMEOUT 120)
   endif()
 endif()

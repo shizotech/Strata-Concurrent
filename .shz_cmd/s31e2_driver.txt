@@ -1,0 +1,599 @@
+        // ==================== S3.1e-2: THE CONCURRENT DRIVER ====================
+        //
+        // docs/STAGE3-CONCURRENCY.md §3.1: one engine thread, N slots, ONE step at a time.  This block
+        // runs only when the registry says concurrency is on AND the slot hand-over is available, and it
+        // RETURNS before the serial driver below.  The gate is an early return rather than an `if`
+        // wrapped around the old loop, so the serial driver's text is byte-identical to 0.1.30's:
+        // §7.1's bit-exactness bar becomes a fact about the source, not a claim about behaviour.
+        //
+        // WHY `&& swaps_on`.  A slot switch IS a save/restore (§5.3).  With STRATA_NO_SWAP=1 the
+        // hand-over is disabled, so two conversations would share one session with nothing moving
+        // between them - plausible garbage, not concurrency.  S3.1d's promise is that the env switch
+        // "falls back to today's serial behaviour without recompiling", and that is what this does: the
+        // tagged wire stays on (S3.1c), the interleaving does not.
+        //
+        // WHAT A STEP IS (§3.2).  `run_prefill_step` = one prompt segment (8-15 s at 8 192 tokens),
+        // `run_decode_step` = one verify window (~16-24 ms).  Both pre-emption points already existed in
+        // 0.1.30's code; the scheduler's whole trick is to stop calling them in a `while`.
+        //
+        // ReqCtx LIFETIME - THE HARD PART.  The serial path builds one `ReqCtx` on the loop's stack and
+        // destroys it at the end of the iteration.  A step cannot: the state must outlive the step, so
+        // the driver owns `std::deque<ReqCtx> live`, keyed by request id.  A deque and not a vector
+        // because a reference into it must survive the next `push_back` - the same reason `conv_slots`
+        // is a deque.  Destruction order, checked against the serial path's (mrope scope -> slot guard
+        // -> ReqCtx -> busy scope):
+        //   * `MropeScope` and `StepGuard` are armed per STEP inside an inner scope of `run_one` and
+        //     destroyed when that scope closes - strictly EARLIER than the serial path destroyed them,
+        //     and never while a `ReqCtx` is missing (the guard's `ctx` always points at the live
+        //     context).  `drop_ctx()` - the only thing that destroys a context - runs after that scope.
+        //   * `StepGuard` is 0.1.30's `SlotGuard` plus one condition: it releases the row only once
+        //     `R.finished` is set.  Arming the serial guard per step would end every request after its
+        //     first step; arming it per request is impossible, because the request outlives the step.
+        //     `SlotGuard` itself is NOT touched, so the serial path's guard is unchanged.
+        //   * `MropeScope` keeps the serial path's exact `skip` predicate (`!swaps_on ||
+        //     !R.mrope_touched || mounted_id == req_id`), so on a normal step it does nothing and on a
+        //     bail-out it restores the mounted slot's positions - which is what R7 needs MORE with N
+        //     slots, not less.
+        //   * `cur`/`live`/`checks`/`row_ptr`/`img_rows`/`mrope_host` stay serve-scope, so nothing about
+        //     when a conversation image or a CUDA buffer exists changes.  `sp.embd_rows` is re-pointed
+        //     before every step, and R7's exclusivity is enforced at ADMISSION (below) rather than
+        //     discovered in the middle of a read.
+        //   * `progress().busy` is held for the whole driver, as `BusyScope` held it for a serial
+        //     iteration, and released while the driver blocks for a line, so an idle engine is never
+        //     reported as stalled.
+        //
+        // THE INVARIANTS THIS LOOP ENFORCES.  Each is a predicate in
+        // include/strata/program/serve_driver.hpp and each is pinned by src/program/serve_driver_test.cpp:
+        //   1. a step runs only for the slot the live session reflects (§5.3) - `dispatch_step` answers
+        //      `swap`, never a step, for anything else;
+        //   2. the prompt loan has ONE owner (R8): `loan`, mirrored by `R.loan_held`, and a slot waiting
+        //      for it is DEFERRED rather than re-picked forever;
+        //   3. at most one `swap_to` per iteration, so a refused hand-over cannot spin;
+        //   4. an admitted slot holds an active-slot permit and every exit path releases it - a stranded
+        //      permit is the one bug that would deadlock admission, because the permit bounds everything;
+        //   5. the watchdog sees one heartbeat per ACTIVE slot (R3) and the driver drains its verdicts;
+        //   6. at most one live request holds the one M-RoPE table and the one image-row pointer set
+        //      (R7), enforced at admission.
+        if (slots_reg.concurrent() && swaps_on) {
+            namespace drv = strata::program::serve_driver;
+            using DStep = strata::program::serve_driver::Step;
+            using PAct = strata::program::slot::Pick::Action;
+            using SState = strata::program::slot::State;
+            // ---- the driver's own state --------------------------------------------------------
+            std::deque<ReqCtx> live;                       // one per admitted request, keyed by R.id
+            auto ctx_of = [&](int64_t id) -> ReqCtx* {
+                for (ReqCtx& R : live) if (R.id == id) return &R;
+                return nullptr;
+            };
+            drv::Loan loan;                                // R8: the one prompt loan, and who holds it
+            // Slots whose next step needs the loan and cannot have it.  They must not be picked again
+            // until the loan is free, or the loop spins on a slot that can never advance while the
+            // holder - a different row, later in the registry's array - never gets the session.
+            std::deque<int64_t> deferred;
+            auto is_deferred = [&](int64_t id) {
+                for (const int64_t d : deferred) if (d == id) return true;
+                return false;
+            };
+            auto clear_deferred = [&]() {
+                deferred.clear();
+                // The once-per-slot "waiting for the loan" flag has to go with the queue entry, or a
+                // slot that blocks a SECOND time would never be deferred again and the loop would spin.
+                for (ReqCtx& Q : live) Q.loan_waited = false;
+            };
+            int64_t admitted = 0, steps_run = 0, swaps_done = 0, refused = 0, deferred_hits = 0;
+            bool driver_quit = false, driver_fatal = false;
+            // A line read from stdin that could not be admitted yet.  It is kept here rather than put
+            // back on the queue so a refusal cannot reorder the client's requests.
+            std::string held_line;
+            // Non-blocking: the driver may never wait for a line while another slot has work, or
+            // concurrency would be one request deep again.
+            auto try_next_line = [&](std::string& out) -> bool {
+                std::lock_guard<std::mutex> lk(in_mu);
+                if (in_lines.empty()) return false;
+                out = std::move(in_lines.front());
+                in_lines.pop_front();
+                return true;
+            };
+            // ---- the watchdog's per-slot record (R3) -------------------------------------------
+            // `progress().beats` is process-wide, so a slot is "current" when the counter moved while
+            // that slot was the one running.  A slot whose step began long ago and has not moved the
+            // counter is the one that is actually stuck.
+            auto watch_begin = [&](int64_t id) {
+                const uint64_t b = strata::core::progress().beats.load();
+                const int64_t t = drv::now_ms();
+                std::lock_guard<std::mutex> lk(watch_mu);
+                for (strata::program::serve_driver::SlotWatch& w : watch)
+                    if (w.id == id) { w.step_started_ms = t; w.beats_at_start = b; return; }
+                watch.push_back(strata::program::serve_driver::SlotWatch{id, t, b});
+            };
+            auto watch_idle = [&](int64_t id) {
+                std::lock_guard<std::mutex> lk(watch_mu);
+                for (strata::program::serve_driver::SlotWatch& w : watch)
+                    if (w.id == id) { w.step_started_ms = 0; return; }
+            };
+            auto watch_forget = [&](int64_t id) {
+                std::lock_guard<std::mutex> lk(watch_mu);
+                for (size_t i = 0; i < watch.size(); ++i)
+                    if (watch[i].id == id) { watch.erase(watch.begin() + (std::ptrdiff_t) i); return; }
+            };
+            // ---- the per-request prompt-path view ----------------------------------------------
+            // `sp.embd_rows` is one process-wide pointer into the serve-scope `row_ptr`, and
+            // `prep_request` set it for whichever request arrived last.  With N slots the driver has to
+            // re-point it before every step, or a text request's step would read an image request's
+            // rows.  Safe because admission keeps at most one GENI request live (R7).
+            auto arm_prompt_view = [&](ReqCtx& R) {
+                sp.embd_rows = R.geni ? row_ptr.data() : nullptr;
+            };
+            // The segment end the NEXT prefill step will read to, so `windows_ok` can be asked with the
+            // same arguments 0.1.30's `for` used.  `run_prefill_step` re-derives it identically.
+            auto next_segment_end = [&](const ReqCtx& R) -> int64_t {
+                for (size_t i = R.seg_i; i < R.seg.size(); ++i)
+                    if (R.seg[i] > R.at) return R.seg[i];
+                return -1;
+            };
+            // ---- §3.4's refuse edge: ERR, release the row, free the permit, keep the process -----
+            // This is also risk R4's fix: 0.1.30's parking failure was a `return 1`, which took the
+            // whole server down over one conversation.
+            auto refuse_line = [&](int64_t id, const std::string& why) {
+                std::printf("%s\n", sp_out.err(why, id).c_str());
+                std::fflush(stdout);
+                std::lock_guard<std::mutex> lk(slot_mu);
+                if (slots_reg.find(id) != nullptr) {
+                    std::string serr;
+                    slots_reg.transition(id, SState::error, serr);
+                    slots_reg.release(id);
+                }
+                ++refused;
+            };
+            // Drop a finished or refused request's context.  Called only after the step's guards have
+            // run, so ~StepGuard never sees a destroyed ReqCtx.
+            auto drop_ctx = [&](int64_t id) {
+                for (size_t i = 0; i < live.size(); ++i) {
+                    if (live[i].id != id) continue;
+                    if (live[i].loan_held) { loan.release(id); live[i].loan_held = false; }
+                    live.erase(live.begin() + (std::ptrdiff_t) i);
+                    break;
+                }
+                watch_forget(id);
+                for (size_t i = 0; i < deferred.size(); ++i)
+                    if (deferred[i] == id) { deferred.erase(deferred.begin() + (std::ptrdiff_t) i); break; }
+            };
+            // The watchdog's verdict: ERR + destroy THAT slot, keep the engine and the other slots.
+            auto kill_slot = [&](int64_t id) {
+                ReqCtx* R = ctx_of(id);
+                if (R == nullptr) return;
+                std::fprintf(stderr, "strata serve: slot %lld made no progress within %d s - ending it and "
+                                     "keeping the engine (stage 3 R3)\n", (long long) id, watchdog_limit_s);
+                if (R->loan_held) {
+                    if (!refill(err))
+                        std::fprintf(stderr, "strata serve: slot %lld: refilling its loan failed (%s)\n",
+                                     (long long) id, err.c_str());
+                    err.clear();
+                    loan.release(id);
+                    R->loan_held = false;
+                    clear_deferred();
+                }
+                R->finished = true;
+                std::printf("%s\n", sp_out.err("no progress within the watchdog limit - this request was ended;"
+                                               " the engine stayed up", id).c_str());
+                std::fflush(stdout);
+                slot_step(id, SState::error);
+                slot_finish(id);
+                drop_ctx(id);
+            };
+            // ---- admit: take one queued line and bring it in (§3.1 step 1) ----------------------
+            // Bounded by the registry's active cap AND by RAM, because a slot is a host-RAM object (R2)
+            // and this box's parking budget can be 0.0 GiB.  A refusal is an ERR and the process lives.
+            auto admit_one = [&]() {
+                // A line already read but not admitted: retry it before reading another, so the
+                // client's order is kept.
+                if (held_line.empty() && !try_next_line(held_line)) return;
+                if (held_line == "QUIT") { driver_quit = true; held_line.clear(); return; }
+                const serve_proto::Request probe = serve_proto::parse_request(
+                    held_line, serve_proto::Defaults{o.pcie_frac, o.spec_min_p}, tagged);
+                if (probe.kind == serve_proto::Kind::stop) {
+                    // A STOP that reached the queue instead of the stdin thread.  `STOP <id>` names a
+                    // slot; a bare STOP keeps 0.1.30's meaning ("the running one"), which
+                    // `bare_stop_target` resolves through the registry.
+                    std::lock_guard<std::mutex> lk(slot_mu);
+                    if (probe.id != serve_proto::kNoId) {
+                        if (!slots_reg.cancel_request(probe.id) && pending_cancel.size() < 64)
+                            pending_cancel.push_back(probe.id);
+                    } else {
+                        const int64_t who = drv::bare_stop_target(slots_reg);
+                        if (who != serve_proto::kNoId) slots_reg.cancel_request(who);
+                    }
+                    held_line.clear();
+                    return;
+                }
+                if (probe.kind != serve_proto::Kind::gen && probe.kind != serve_proto::Kind::geni) {
+                    // 0.1.30's untagged ERR for a line it could not attribute to anything.
+                    std::printf("%s\n", sp_out.err(probe.error.empty() ? serve_proto::err_expected()
+                                                                       : probe.error).c_str());
+                    std::fflush(stdout);
+                    held_line.clear();
+                    return;
+                }
+                if (probe.id == serve_proto::kNoId) {   // a tagged session needs an id to route by
+                    refuse_line(probe.id, "this engine was started with --serve-slots " + std::to_string(slots) +
+                                          ": requests need a request id (GEN <id> <max_new> ...)");
+                    held_line.clear();
+                    return;
+                }
+                if (ctx_of(probe.id) != nullptr) {
+                    refuse_line(probe.id, "request id " + std::to_string((long long) probe.id) +
+                                          " is already running");
+                    held_line.clear();
+                    return;
+                }
+                if (!slots_reg.can_admit()) return;     // the cap: leave the line queued, do not refuse it
+                // R7, as an admission rule rather than a mid-read discovery: `mrope_host`/`d_mrope` and
+                // the one `row_ptr`/`img_rows` set describe ONE sequence.  A GENI request takes them for
+                // as long as it is live, and a text request's prep would rewrite them to the identity
+                // underneath it.  So: no second slot while an image request runs, and no image request
+                // while anything else runs.  In phases 1-3 an image request is served alone.
+                bool any_live = false, image_live = false;
+                for (const ReqCtx& Q : live) { any_live = true; image_live = image_live || Q.geni; }
+                const bool want_image = probe.kind == serve_proto::Kind::geni;
+                if (image_live || (want_image && any_live)) {
+                    // Not a refusal: the request waits, exactly as it does behind the active cap.  The
+                    // client sees a slow first token, not an error.  Say it once per process.
+                    static const bool warned = [&] {
+                        std::fprintf(stderr, "strata serve: an image request holds the one position table, so it "
+                                             "runs alone (stage 3 R7); other requests queue behind it\n");
+                        return true;
+                    }();
+                    (void) warned;
+                    return;
+                }
+                // RAM admission.  The image this slot will hold is the engine's own per-slot estimate
+                // (the parking budget divided by the entries it was sized for), plus what the other
+                // live slots hold that is not in the cache yet.
+                const auto avail = strata::core::conversation_available_memory();
+                const uint64_t floor_b = (uint64_t) o.conversation_cache_min_free_mib * 1024ull * 1024ull;
+                const uint64_t est = drv::slot_estimate(conversations.budget(), conversations.slots());
+                uint64_t held = 0;
+                for (const ReqCtx& Q : live) held += (uint64_t) (Q.image_bytes > 0 ? Q.image_bytes : 0);
+                if (!drv::admit_fits_ram(avail.has_value(), avail.value_or(0), floor_b, est, held)) {
+                    refuse_line(probe.id, drv::refuse_reason(drv::Refuse::ram));
+                    held_line.clear();
+                    return;
+                }
+                live.push_back(ReqCtx{});
+                ReqCtx& R = live.back();
+                R.line = held_line;
+                R.has_line = true;
+                R.id = probe.id;
+                R.image_bytes = (int64_t) est;
+                held_line.clear();
+                ++request_index;      // S0.3 lever 4: the parking backoff's window is in requests
+            };
+            // ---- the hand-over (§3.1 step 3) ---------------------------------------------------
+            // `swap_to` owns the order, the residency drain and the loan return (S3.1d) - the driver
+            // only decides WHEN, and it never retries a hand-over that already wrote the session.
+            auto do_swap = [&](ReqCtx& R, std::string& serr) -> bool {
+                // The image to mount: this slot's parked branch, if the cache still holds one.  A slot
+                // being admitted for the first time has no branch yet and `prep_request` does 0.1.30's
+                // own mount search for it, so the driver only mounts a slot it has already run.
+                if (R.phase != drv::Phase::queued && mount_image == std::nullopt) {
+                    const strata::program::serve_swap::SlotConv& c = conv_of(R.id);
+                    if (c.resumable && c.live_ok && !c.live.empty()) {
+                        const auto pre = conversations.best(c.live, c.live_imgs, c.cvec_cached);
+                        if (pre.tokens > 0) mount_image.emplace(conversations.take(pre.index));
+                    }
+                }
+                // R8, and the invariant the whole loan rule rests on: THE LOAN OWNER IS ALWAYS THE
+                // MOUNTED SLOT, because only the mounted slot can run a step, and every hand-over
+                // refills (`serve_swap::run`'s `return_loan` step, which always runs).  So a hand-over
+                // ends the current holder's loan whether it succeeds or fails, and the driver's view
+                // has to say the same thing the caches now do.
+                if (loan.held()) {
+                    if (ReqCtx* H = ctx_of(loan.owner)) H->loan_held = false;
+                    loan.release(loan.owner);
+                    clear_deferred();
+                }
+                bool poisoned = false;
+                if (swap_to(R.id, serr, poisoned, /*restore_positions=*/true)) {
+                    ++swaps_done;
+                    std::lock_guard<std::mutex> lk(slot_mu);
+                    slots_reg.set_active(R.id);
+                    return true;
+                }
+                if (poisoned || swap_wrote_session) {
+                    // 0.1.30's rule, kept verbatim: a restore that failed mid-write is fatal to the
+                    // session, and a hand-over that already wrote it must not be retried.
+                    std::printf("%s\n", sp_out.err("slot hand-over failed after the restore: " + serr, R.id).c_str());
+                    std::fflush(stdout);
+                    std::fflush(stderr);
+                    return false;
+                }
+                // Refused BEFORE anything was written (R7 exclusivity, a failed drain, a failed save):
+                // the session is intact.  Do not run this slot's step; let the pick try something else.
+                std::fprintf(stderr, "strata serve: swap to slot %lld refused (%s) - trying other work\n",
+                             (long long) R.id, serr.c_str());
+                return true;
+            };
+            // A driver-level tie-break over `pick()`: the longest-waiting runnable slot that is NOT
+            // deferred.  `pick()` cannot know about the loan (it is engine state, not registry state),
+            // so without this the loop would re-pick the blocked slot forever and the holder - a later
+            // row in the registry's fixed array - would never get the session.  That is a livelock, and
+            // it is the one thing a one-thread scheduler must never do.
+            auto pick_unblocked = [&](int64_t now) -> strata::program::slot::Pick {
+                strata::program::slot::Pick p;      // idle
+                std::lock_guard<std::mutex> lk(slot_mu);
+                const int64_t act = slots_reg.active_id();
+                int64_t best = serve_proto::kNoId, bw = -1;
+                slots_reg.each([&](const strata::program::slot::Slot& s) {
+                    if (s.state != SState::prefilling && s.state != SState::decoding &&
+                        s.state != SState::cancelling) return;
+                    if (is_deferred(s.id)) return;
+                    const int64_t w = slots_reg.waited_ms(now, s);
+                    if (w > bw) { bw = w; best = s.id; }
+                });
+                if (best == serve_proto::kNoId) return p;
+                p.action = (best == act) ? PAct::run : PAct::swap;
+                p.id = best;
+                if (const strata::program::slot::Slot* s = slots_reg.find(best)) p.state = s->state;
+                p.waited_ms = bw > 0 ? bw : 0;
+                p.why = "driver-loan-tiebreak";
+                return p;
+            };
+            // ---- run ONE step of ONE slot ------------------------------------------------------
+            auto run_one = [&](ReqCtx& R, DStep s) {
+                req_id = R.id;
+                arm_prompt_view(R);
+                // A STOP that arrived between requests is stale, exactly as the serial path cleared it
+                // at the top of its iteration.  The per-slot `cancel` flag is what carries the intent
+                // now: the stdin thread sets both, and `stopped()` reads the slot's.
+                stop_req.store(false);
+                {
+                    std::lock_guard<std::mutex> lk(slot_mu);
+                    running_id.store(R.id);
+                }
+                const int64_t t0 = drv::now_ms();
+                bool ran = true;
+                {
+                    // 0.1.30's SlotGuard, plus `finished`: armed per step, it releases the row only
+                    // when the request actually ended.  Same destructor order (mrope, then slot).
+                    struct StepGuard {
+                        ReqCtx* ctx = nullptr;
+                        std::function<void(int64_t)> finish;
+                        ~StepGuard() { if (ctx && ctx->slot_open && ctx->finished && finish) finish(ctx->id); }
+                    } step_guard{&R, std::function<void(int64_t)>(slot_finish)};
+                    MropeScope mrope_scope;
+                    mrope_scope.skip = [&]() { return !swaps_on || !R.mrope_touched || mounted_id == req_id; };
+                    mrope_scope.restore = [&]() {
+                        if (mounted_id == strata::program::serve_proto::kNoId) return;
+                        apply_positions(conv_of(mounted_id));
+                        if (!mrope_host.empty()) upload_mrope_table();
+                        mrope_owner = mounted_id;
+                    };
+                    watch_begin(R.id);
+                    if (s == DStep::admit) {
+                        const Prep pr = prep_request(R, R.line);
+                        R.has_line = false;
+                        if (pr == Prep::ok) {
+                            plan_prompt_segments(R);
+                            R.phase = drv::Phase::prefill;
+                            R.pp_total = pp_total; R.pp_from = pp_from;
+                            R.pp_t0 = pp_t0; R.pp_next_check = pp_next_check;
+                            {
+                                std::lock_guard<std::mutex> lk(slot_mu);
+                                if (strata::program::slot::Slot* sl = slots_reg.find(R.id)) sl->started_ms = t0;
+                                slots_reg.set_active(R.id);   // §5.3: the session now reflects this slot
+                            }
+                            ++admitted;
+                        } else if (pr == Prep::rejected) {
+                            R.finished = true;                // the guard releases the row
+                        } else {
+                            R.fail = 1;
+                        }
+                    } else if (s == DStep::prefill) {
+                        // The prompt-progress state belongs to THIS request while it reads.
+                        pp_total = R.pp_total; pp_from = R.pp_from;
+                        pp_t0 = R.pp_t0; pp_next_check = R.pp_next_check;
+                        const int64_t to = next_segment_end(R);
+                        const bool batched = to > R.at && !windows_ok(R.at, to);
+                        if (batched && !loan.may_lend(R.id)) {
+                            // R8: the loan is ONE loan.  Never lend it twice - defer, and say so once.
+                            if (!R.loan_waited) {
+                                R.loan_waited = true;
+                                deferred.push_back(R.id);
+                                ++deferred_hits;
+                                std::fprintf(stderr, "strata serve: slot %lld waits for the prompt loan "
+                                                     "(held by slot %lld)\n", (long long) R.id,
+                                             (long long) loan.owner);
+                            }
+                            ran = false;
+                        } else {
+                            if (batched && loan.acquire(R.id)) R.loan_held = true;
+                            const Step r = run_prefill_step(R);
+                            R.pp_next_check = pp_next_check;
+                            // A segment that went through the verify windows REFILLED first (0.1.30's
+                            // `if (win && !refill(err))`), so a loan this slot held from an earlier
+                            // batched segment is gone again - mirror it.  A batched segment keeps the
+                            // loan until `finish_prefill` refills (the sticky loan, S0.3 lever 1).
+                            if (!batched && R.loan_held) { loan.release(R.id); R.loan_held = false; }
+                            else if (batched && R.loan_held) loan.acquire(R.id);
+                            if (r == Step::progressed) R.phase = drv::Phase::prefill;
+                            else if (r == Step::finished || r == Step::cancelled) R.phase = drv::Phase::prefill_end;
+                            else if (r == Step::needs_swap) R.phase = drv::Phase::prefill;
+                            else if (r == Step::error) R.fail = 1;
+                            else if (r == Step::fatal_exit) R.fail = 2;
+                        }
+                    } else if (s == DStep::prefill_end) {
+                        pp_total = R.pp_total; pp_from = R.pp_from;
+                        pp_t0 = R.pp_t0; pp_next_check = R.pp_next_check;
+                        const Step r = finish_prefill(R);   // this is the call that refills the loan
+                        if (R.loan_held) { loan.release(R.id); R.loan_held = false; }
+                        if (r == Step::error) R.fail = 1;
+                        else R.phase = drv::Phase::decode;
+                        if (!loan.held()) clear_deferred();   // the waiters can go now
+                    } else if (s == DStep::decode) {
+                        if (loan.held()) {
+                            // A verify window may not read over a lent cache: `refill` puts the expert
+                            // rows back.  Normally the hand-over's return_loan step already did this;
+                            // it is belt-and-braces so a window can never see a lent slot.
+                            if (!refill(err)) {
+                                std::printf("%s\n", sp_out.err("refilling a lent slot failed: " + err, R.id).c_str());
+                                std::fflush(stdout);
+                                err.clear();
+                                R.fail = 1;
+                            } else {
+                                for (ReqCtx& Q : live) Q.loan_held = false;
+                                loan.release(loan.owner);
+                                clear_deferred();
+                            }
+                        }
+                        if (ran) {
+                            const Step r = run_decode_step(R);
+                            if (r == Step::progressed) R.phase = drv::Phase::decode;
+                            else if (r == Step::finished || r == Step::cancelled) R.phase = drv::Phase::done;
+                            else if (r == Step::error) R.fail = 1;
+                            else if (r == Step::fatal_exit) R.fail = 2;
+                        }
+                    } else if (s == DStep::finish || s == DStep::unwind) {
+                        const Step r = finish_request(R);
+                        if (r == Step::error) R.fail = 1;
+                        else { R.phase = drv::Phase::done; R.finished = true; }
+                    }
+                    watch_idle(R.id);
+                }   // ~MropeScope, then ~StepGuard - the serial path's order, one step at a time
+                // `note_ran` is the fairness clock AND the watchdog's per-slot heartbeat.  A step that
+                // did not run must NOT reset it, or a deferred slot would look served forever.
+                if (ran) {
+                    const int64_t t1 = drv::now_ms();
+                    std::lock_guard<std::mutex> lk(slot_mu);
+                    slots_reg.note_ran(R.id, t1, t1 > t0 ? t1 - t0 : 0);
+                    ++steps_run;
+                }
+                if (R.finished) {
+                    {
+                        // `slot_finish` cleared the registry's active id; the SESSION still reflects
+                        // this conversation until the next hand-over, so put the two back in step.
+                        std::lock_guard<std::mutex> lk(slot_mu);
+                        slots_reg.set_active(mounted_id);
+                    }
+                    drop_ctx(R.id);
+                }
+            };
+            // ---- the loop ----------------------------------------------------------------------
+            std::fprintf(stderr, "%s\n", drv::driver_line(slots, o.starve_ms, swaps_on,
+                                                          conversations.budget(), conversations.slots()).c_str());
+            std::fflush(stderr);
+            struct DriverBusy {
+                DriverBusy() { strata::core::progress().busy.store(true); strata::core::progress_at("request"); }
+                ~DriverBusy() { strata::core::progress().busy.store(false); strata::core::progress_at("idle"); }
+                void off() { strata::core::progress().busy.store(false); strata::core::progress_at("idle"); }
+                void on() { strata::core::progress().busy.store(true); strata::core::progress_at("request"); }
+            } busy_scope;
+            while (!driver_quit && !driver_fatal) {
+                // 1. the watchdog's verdicts first (R3): they free permits and change what is pickable.
+                for (;;) {
+                    int64_t kid = serve_proto::kNoId;
+                    {
+                        std::lock_guard<std::mutex> lk(watch_mu);
+                        if (!watch_kill.empty()) { kid = watch_kill.front(); watch_kill.pop_front(); }
+                    }
+                    if (kid == serve_proto::kNoId) break;
+                    kill_slot(kid);
+                }
+                // 2. admit, bounded by the cap and by RAM.  One admission per pass, so a burst of lines
+                //    cannot starve the slots already running.
+                admit_one();
+                if (driver_quit) break;
+                // 3. pick.
+                const int64_t now = drv::now_ms();
+                strata::program::slot::Pick p;
+                {
+                    std::lock_guard<std::mutex> lk(slot_mu);
+                    p = slots_reg.pick(now);
+                }
+                if (p.action == PAct::idle) {
+                    // Nothing runnable: release the watchdog's "busy" while waiting for a line, exactly
+                    // as 0.1.30's BusyScope did between iterations, then block for one.
+                    busy_scope.off();
+                    const bool got = !held_line.empty() || next_line(held_line);
+                    busy_scope.on();
+                    if (!got) break;
+                    continue;
+                }
+                if ((p.action == PAct::run || p.action == PAct::swap) && is_deferred(p.id)) {
+                    const strata::program::slot::Pick q = pick_unblocked(now);
+                    if (q.action != PAct::idle) p = q;
+                    else {
+                        // Everything runnable is waiting for the loan and its holder is not runnable.
+                        // Yield rather than spin; the holder becomes runnable on the next pass.
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        continue;
+                    }
+                }
+                ReqCtx* R = ctx_of(p.id);
+                if (R == nullptr) {
+                    // A row with no context: its request was refused or finished and its release was
+                    // missed.  Say so loudly and free the permit - a stranded permit is the one bug that
+                    // would deadlock admission, because the permit IS the bound on everything else.
+                    std::fprintf(stderr, "strata serve: slot %lld picked with no request context - releasing it\n",
+                                 (long long) p.id);
+                    {
+                        std::lock_guard<std::mutex> lk(slot_mu);
+                        slots_reg.release(p.id);
+                    }
+                    if (mounted_id == p.id) mounted_id = serve_proto::kNoId;
+                    watch_forget(p.id);
+                    continue;
+                }
+                // 4. fairness (OQ4).  `pick()` bounds a SWAP by --starve-ms; what only the driver can
+                //    see is a slot that stays pickable but never gets served (the loan, a refused
+                //    hand-over, a cap that never frees).  A real wedge is caught by the watchdog (the
+                //    heartbeat freezes and every watched slot stalls with it), so here the bound only
+                //    reports: killing a slot that is fairly waiting behind a 36 k-token read would be
+                //    worse than the bug it guards against.
+                if (drv::slot_starved_to_death(p.waited_ms, (int64_t) watchdog_limit_s * 1000)) {
+                    static int64_t last_warn_ms = 0;
+                    if (now - last_warn_ms >= 10000) {
+                        last_warn_ms = now;
+                        std::fprintf(stderr, "strata serve: slot %lld has waited %lld ms for the GPU "
+                                             "(starve bound %lld ms, %lld slot(s) deferred on the prompt "
+                                             "loan)\n", (long long) p.id, (long long) p.waited_ms,
+                                     (long long) o.starve_ms, (long long) deferred.size());
+                    }
+                }
+                // 5. dispatch: hand the session over if that is what pick asked for, then ONE step.
+                DStep s = drv::dispatch_step(p, R->phase);
+                if (s == DStep::swap) {
+                    std::string serr;
+                    if (!do_swap(*R, serr)) { driver_fatal = true; break; }
+                    if (mounted_id != R->id) continue;   // refused before writing: try other work
+                    strata::program::slot::Pick q;
+                    q.action = PAct::run;
+                    q.id = p.id;
+                    q.state = p.state;
+                    q.waited_ms = p.waited_ms;
+                    q.why = p.why;
+                    s = drv::dispatch_step(q, R->phase);
+                }
+                if (s == DStep::none) continue;
+                run_one(*R, s);
+                // 6. a failure the step could not act on itself (returning from inside a step lambda
+                //    would have skipped the slot's unwind and leaked its permit).
+                ReqCtx* A = ctx_of(p.id);
+                if (A != nullptr) {
+                    if (A->fail == 2) { std::fflush(stdout); std::fflush(stderr); std::_Exit(1); }
+                    if (A->fail == 1) { driver_fatal = true; break; }
+                }
+            }
+            // The engine is ending: give every live slot its answer rather than closing the pipe under
+            // the server, then exit normally.
+            for (ReqCtx& R : live)
+                if (R.slot_open) std::printf("%s\n", sp_out.err("engine shutting down", R.id).c_str());
+            std::fflush(stdout);
+            std::fprintf(stderr, "strata serve: concurrent driver finished: %lld admitted, %lld steps, "
+                                 "%lld swaps, %lld refused, %lld deferred step(s), %lld slot(s) still live\n",
+                         (long long) admitted, (long long) steps_run, (long long) swaps_done,
+                         (long long) refused, (long long) deferred_hits, (long long) live.size());
+            std::fflush(stderr);
+            return driver_fatal ? 1 : 0;
+        }
+        // ---- S3.1e-2: everything below is 0.1.30's serial driver, unchanged.  The gate above is an
+        // early return, so this loop's text is byte-identical to the pre-S3.1e-2 source.

@@ -1,0 +1,1 @@
+cd /ssd/Strata && sed -i 's/banner numbers them `DEV-1 … DEV-15`/banner numbers them `DEV-1 … DEV-14`/' .megamind/roadmap.md && grep -n "DEV-1 … DEV" .megamind/roadmap.md .megamind/src/program/s433-prefill-protocol-notes.md; echo "--- notes list count ---"; grep -c "^[0-9]*\. \*\*" .megamind/src/program/s433-prefill-protocol-notes.md

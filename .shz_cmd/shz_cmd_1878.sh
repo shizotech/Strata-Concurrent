@@ -1,0 +1,1 @@
+cd /ssd/Strata; echo "=== admission-time / startup check (contract item 3) ==="; grep -n "parking_off_refuses_slots\|can_never_park\|never be parked\|NEVER parkable" src/program/generate.cpp | head; echo; echo "=== activity line wired? ==="; grep -n "activity_line(\|serve_trace\b\|trace_pick(\|trace_phase(\|trace_loan_defer(" src/program/generate.cpp | head -12

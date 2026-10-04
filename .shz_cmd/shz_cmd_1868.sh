@@ -1,0 +1,1 @@
+cd /tmp/s3build && ninja 2>&1 | grep -E " error " | head -5; ctest 2>&1 | grep -E "tests passed|Failed"; for t in serve_swap_test serve_driver_test slot_test serve_proto_test prefill_loan_test conversation_cache_test conv_cache_test conversation_memory_test; do printf "%-26s " $t; ./$t >/dev/null 2>&1 && echo OK || echo FAIL; done

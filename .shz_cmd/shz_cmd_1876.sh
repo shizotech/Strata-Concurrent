@@ -1,0 +1,1 @@
+cd /ssd/Strata; python3 .shz_cmd/s31e2_serial_proof.py 2>&1 | tail -1; python3 .shz_cmd/s31e2_output_proof.py 2>&1 | tail -2; echo "=== build ==="; cd build && ninja 2>&1 | grep -E " error |Error" | head -3; echo "cuda rc=$?"

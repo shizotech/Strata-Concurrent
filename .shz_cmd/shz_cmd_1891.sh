@@ -1,0 +1,1 @@
+cd /ssd/Strata; ls -l --time-style=+'%H:%M' build/strata; timeout 400 python3 -m pytest serve/test_server.py -q 2>&1 | tail -1; python3 .shz_cmd/s31e2_serial_proof.py 2>&1|tail -1; python3 .shz_cmd/s31e2_output_proof.py 2>&1|tail -1

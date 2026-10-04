@@ -6,6 +6,8 @@
 
 #include <atomic>
 #include <cerrno>
+#include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -25,9 +27,13 @@
 #include <windows.h>
 #else
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
+#include <filesystem>
+#include <system_error>
 #include <linux/mman.h>
 #ifndef MAP_HUGE_2MB
 #define MAP_HUGE_2MB (21 << 26)
@@ -38,28 +44,219 @@ namespace strata::core {
 
 namespace {
 
-constexpr uint64_t kSharedArenaHeaderBytes = 4096;
 constexpr char kSharedArenaMagic[16] = "STRATA-ARENA-V1";
 
+/// The on-disk header.  Its layout is the ABI documented in pinned.hpp: the last four fields ARE the old
+/// header's `reserved[4]`, which is why they sit here instead of after it - an engine built before this
+/// protocol must still read a new file and refuse it correctly, and a new engine must read an old file and
+/// see `state == 0` ("not populated"), never garbage.
 struct SharedArenaHeader {
     char magic[16];
     uint32_t version;
     uint32_t header_bytes;
     uint64_t arena_bytes;
     uint64_t pack_hash;
-    uint64_t reserved[4];
+    uint64_t state;     ///< 0 = the body is not populated, kSharedArenaReady = safe to borrow
+    uint64_t owner;     ///< pid that owns the load, 0 = nobody does
+    uint64_t nonce;     ///< random per load attempt: says WHICH attempt owns it, not just which pid
+    uint64_t owner_start;  ///< the owner's process start time (0 = unknown / an old file)
 };
 static_assert(sizeof(SharedArenaHeader) <= kSharedArenaHeaderBytes);
+// The offsets in the header are part of the protocol, so they are pinned to the struct rather than written
+// twice: if somebody reorders these fields, this file stops compiling instead of silently publishing an
+// arena every other process reads as state 0.
+static_assert(kSharedArenaStateOffset == offsetof(SharedArenaHeader, state));
+static_assert(kSharedArenaOwnerOffset == offsetof(SharedArenaHeader, owner));
+static_assert(kSharedArenaNonceOffset == offsetof(SharedArenaHeader, nonce));
+static_assert(kSharedArenaOwnerStartOffset == offsetof(SharedArenaHeader, owner_start));
+
+/// What the shared-backing reservation decided, reported back to the PinnedArena ctor (and from there to the
+/// driver).  `role`: 0 = not shared / failed, 1 = this process loads, 2 = the bytes are already there.
+struct SharedReservation {
+    int role = 0;
+    uint64_t nonce = 0;
+    uint64_t owner_pid = 0;      ///< the header's owner when the arena was borrowed
+    uint64_t waited_ms = 0;
+    std::string reason;          ///< why this process got that role, for the note
+};
+
+/// Why the working-set lock is skipped for a shared backing.  It is not a shortcut: on Linux the shared arena
+/// is a tmpfs file (/dev/shm), and tmpfs pages are ALREADY unevictable - they have no backing store to be
+/// written back to, so mlock can only fail.  It does fail here, against `ulimit -l` = 8 MiB, and the old code
+/// paid for that failure twice a start with a scary note (`strata-iq3_s.log:1438`).  On Windows the shared
+/// branch refuses the arena before it ever gets here.
+std::string lock_skipped_for_shared_file_note() {
+    return "working-set lock skipped: the shared-file arena is tmpfs-backed, whose pages are already "
+           "unevictable (mlock would only fail against ulimit -l)";
+}
+
+}  // namespace
+
+#ifndef _WIN32
+namespace {
+
+/// How long a process may wait for somebody else's load before it decides that load is never coming.  Sized
+/// from the measurements, not from a guess: the same 46.84 GiB arena read at 1.4 GiB/s from a warm cache and
+/// at 0.09 GiB/s in a throttled launch context (strata-iq3_s.log), so the slow arm needs ~9 minutes; 20 is the
+/// point where waiting longer is worse than doing the read twice.  STRATA_SHARED_ARENA_WAIT_MS overrides it
+/// (0 = never wait, take the load over at once) - the same A/B knob style as STRATA_ARENA_LOCK.
+uint64_t shared_arena_wait_ms() {
+    const char* env = std::getenv("STRATA_SHARED_ARENA_WAIT_MS");
+    if (env == nullptr || *env == 0) return 20ull * 60ull * 1000ull;
+    return std::strtoull(env, nullptr, 10);
+}
+
+/// Take the backing file's advisory lock.  It is held only for a DECISION (microseconds), never across a load,
+/// so failing to get it within a few seconds means a foreign flock - report it instead of hanging at startup.
+bool arena_lock(int fd, std::string& note) {
+    constexpr uint64_t kRetryMs = 20, kGiveUpMs = 10000;
+    for (uint64_t waited = 0;; waited += kRetryMs) {
+        // `::flock`, not `flock`: <fcntl.h> also declares `struct flock` (POSIX record locks), and in C++ that
+        // tag is a type name, so an unqualified call can be parsed as a declaration instead of a call.
+        if (::flock(fd, LOCK_EX | LOCK_NB) == 0) return true;
+        if (errno != EWOULDBLOCK && errno != EAGAIN) {
+            note = std::string("cannot lock shared arena: ") + std::strerror(errno);
+            return false;
+        }
+        if (waited >= kGiveUpMs) {
+            note = "shared arena is locked by another process for more than " + std::to_string(kGiveUpMs / 1000) +
+                   " s; refusing rather than starting on an arena whose state cannot be read";
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(kRetryMs));
+    }
+}
+
+void arena_unlock(int fd) { (void) ::flock(fd, LOCK_UN); }
+
+bool read_arena_header(int fd, SharedArenaHeader& hdr) {
+    const ssize_t got = pread(fd, &hdr, sizeof hdr, 0);
+    return got == (ssize_t) sizeof hdr;
+}
+
+bool write_arena_header(int fd, const SharedArenaHeader& hdr) {
+    return pwrite(fd, &hdr, sizeof hdr, 0) == (ssize_t) sizeof hdr;
+}
+
+/// Is `pid` a running process?  `/proc/<pid>` is the only portable-enough answer that needs no signal
+/// permission (kill(pid, 0) says EPERM for somebody else's process, which is NOT "dead").  When /proc itself
+/// is not mounted the answer is unknown, and unknown must mean ALIVE: guessing "dead" would let two processes
+/// load the same arena at once, which is the exact bug this protocol exists to fix.
+bool pid_alive(uint64_t pid) {
+    if (pid == 0 || pid > (uint64_t) INT32_MAX) return false;
+    struct stat st{};
+    char path[64];
+    std::snprintf(path, sizeof path, "/proc/%llu", (unsigned long long) pid);
+    if (stat(path, &st) == 0) return true;
+    return stat("/proc", &st) != 0;
+}
+
+/// The process's start time, from field 22 of /proc/<pid>/stat (clock ticks since boot).
+///
+/// A pid on its own CANNOT prove a loader is still the loader: if the owner was SIGKILLed and its pid was
+/// recycled, `/proc/<pid>` exists, `pid_alive` says yes, and a process that trusts the pid alone stalls for the
+/// whole wait budget on a load that will never happen.  The start time distinguishes the dead owner from the
+/// recycled pid.  0 means "unknown" (no /proc, or a file written before this field existed), and unknown is
+/// treated as a MATCH - the conservative answer, same rule as `pid_alive`.
+uint64_t proc_start_time(uint64_t pid) {
+    if (pid == 0 || pid > (uint64_t) INT32_MAX) return 0;
+    char path[64];
+    std::snprintf(path, sizeof path, "/proc/%llu/stat", (unsigned long long) pid);
+    FILE* f = std::fopen(path, "rb");
+    if (f == nullptr) return 0;
+    // The comm field is field 2 and is parenthesised and may contain spaces and parentheses, so the fields
+    // after it are counted from the LAST ')' rather than by splitting on ' '.
+    char buf[4096];
+    const size_t n = std::fread(buf, 1, sizeof buf - 1, f);
+    std::fclose(f);
+    if (n == 0) return 0;
+    buf[n] = 0;
+    char* close_paren = std::strrchr(buf, ')');
+    if (close_paren == nullptr) return 0;
+    // Fields 3.. are space separated after the ')': field 22 is 20 fields further along.
+    const char* p = close_paren + 1;
+    for (int field = 3; field < 22 && *p != 0; ++field) {
+        while (*p == ' ') ++p;
+        while (*p != 0 && *p != ' ') ++p;
+    }
+    while (*p == ' ') ++p;
+    if (*p == 0) return 0;
+    return std::strtoull(p, nullptr, 10);
+}
+
+/// Does the header's claim still belong to a live process?  Both the pid and its start time must match.
+bool claim_alive(uint64_t pid, uint64_t start_time) {
+    if (!pid_alive(pid)) return false;
+    if (start_time == 0) return true;   // the file does not say; do not guess "dead"
+    const uint64_t now = proc_start_time(pid);
+    if (now == 0) return true;          // /proc unreadable for this pid; same conservative answer
+    return now == start_time;
+}
+
+/// Tells two load attempts apart, which is what matters after pid reuse: a stale header naming a pid that has
+/// since been recycled must not be believed forever.  Not a CSPRNG and does not need to be - it must simply
+/// not repeat within a machine's pid lifetime, so time + pid + a stack address, mixed.
+uint64_t make_load_nonce() {
+    uint64_t x = (uint64_t) std::chrono::steady_clock::now().time_since_epoch().count();
+    x ^= ((uint64_t) (uint32_t) getpid() << 32);
+    x ^= (uint64_t) (uintptr_t) &x;
+    x *= 0x9e3779b97f4a7c15ull;
+    x ^= x >> 29;
+    return x != 0 ? x : 1;
+}
+
+}  // namespace
+#endif  // !_WIN32
+
+#ifndef _WIN32
+namespace {
+
+/// Can a fresh backing file of `file_bytes` actually be created at `path`?  True when the check cannot be
+/// made (no statvfs, an existing file, an unopenable path - the open below reports that properly), because a
+/// guess is better here than refusing a working configuration; false only when the filesystem says NO.
+///
+/// POSIX-only, like the shared-file branch that calls it: `statvfs` and its header do not exist on Windows,
+/// where a shared arena is refused before this is ever reached.
+bool shared_file_fits(const std::string& path, uint64_t file_bytes, std::string& why) {
+    std::error_code ec;
+    if (std::filesystem::exists(path, ec)) return true;   // already sized; its space is committed
+    struct statvfs sv{};
+    const std::filesystem::path p(path);
+    const std::filesystem::path parent = p.has_parent_path() ? p.parent_path() : std::filesystem::path(".");
+    if (statvfs(parent.c_str(), &sv) != 0) {
+        why = "cannot read the free space of " + parent.string() + ": " + std::strerror(errno);
+        return true;   // not our business to refuse on a check that failed
+    }
+    const uint64_t block = sv.f_frsize ? sv.f_frsize : sv.f_bsize;
+    const uint64_t avail = (uint64_t) sv.f_bavail * block;
+    if (avail >= file_bytes) return true;
+    char buf[160];
+    std::snprintf(buf, sizeof buf, "%s has %llu MiB free and it needs %llu MiB",
+                  parent.string().c_str(), (unsigned long long) (avail >> 20),
+                  (unsigned long long) (file_bytes >> 20));
+    why = buf;
+    return false;
+}
+
+}  // namespace
+#endif  // !_WIN32
+
+namespace {
 
 // A 2 MB-aligned reservation.  Large pages first, then the largest alignment the OS will give us for free.
 // A non-empty shared_file instead maps one file whose first 4 KiB identify the pack and whose remaining bytes
 // are the resident arena.  This shared-file layout is intended for tmpfs (/dev/shm); hugetlbfs would need
 // hugepage-aligned file size and arena offset rather than the 4 KiB header layout used here.
 void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::string& shared_file,
-              uint64_t shared_pack_hash, void*& mapping_base, uint64_t& mapping_bytes) {
+              uint64_t shared_pack_hash, void*& mapping_base, uint64_t& mapping_bytes,
+              SharedReservation& shared) {
     mapping_base = nullptr;
     mapping_bytes = 0;
 #ifdef _WIN32
+    // The shared-file protocol below is POSIX-only (flock, /proc, mmap).  Windows still refuses a shared arena,
+    // so the role struct stays untouched there rather than reporting a decision nobody made - and this keeps the
+    // parameter from reading as dead code under -Wunused-parameter.
+    (void) shared;
     if (!shared_file.empty()) {
         note = "shared-file arena backing is not implemented on Windows";
         return nullptr;
@@ -121,14 +318,46 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
             return nullptr;
         }
         const uint64_t file_bytes = kSharedArenaHeaderBytes + bytes;
+        // ENOUGH ROOM BEFORE ANYTHING IS CLAIMED.  A tmpfs is not infinite: Docker's default /dev/shm is
+        // 64 MiB, and a container that gets no --shm-size cannot hold a 47 GiB arena.  `ftruncate` on tmpfs
+        // does NOT fail when the space is not there - it happily makes a sparse file, and the process then
+        // dies of SIGBUS on the first write past the limit, inside the expert load, with no message.  So the
+        // filesystem's own free space is checked here, and a backing that cannot fit is refused the same way
+        // any other unusable one is: the caller falls back to a private arena and says why.
+        //
+        // Only a FRESH file needs the check. An existing file of the right size is already allocated, so its
+        // space is committed; re-checking it would refuse a working arena because some other program filled
+        // the filesystem afterwards, which is a worse answer than letting a ready arena be borrowed.
+        if (!shared_file_fits(shared_file, file_bytes, note)) {
+            note = "shared arena " + shared_file + " cannot hold " + std::to_string(file_bytes) +
+                   " B: " + note;
+            return nullptr;
+        }
+        // O_CLOEXEC matters here, not just for tidiness: the protocol's flock lives on the OPEN FILE
+        // DESCRIPTION, so an exec'd helper that inherited this fd would keep the lock alive after this process
+        // has decided the arena's state - and every later process would then sit in `arena_lock` and refuse to
+        // start.  (fork alone still shares the description; that is why the lock is only ever held across a
+        // decision, never across a load.)
         const int fd = open(shared_file.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
         if (fd < 0) {
             note = "cannot open shared arena " + shared_file + ": " + std::strerror(errno);
             return nullptr;
         }
+
+        // EVERY decision about this file happens under its exclusive advisory lock.  Without it, two processes
+        // that start together both see "not populated", both become loaders, and both write the same 46.84 GiB
+        // through the same MAP_SHARED pages - which is not merely slow, it is a torn arena.  The lock covers
+        // the decision only (read the header, maybe claim the load, maybe map); the load itself runs unlocked,
+        // because holding it across a minute-long read would make every other process sit in `arena_lock`.
+        if (!arena_lock(fd, note)) {
+            close(fd);
+            return nullptr;
+        }
+
         struct stat st{};
         if (fstat(fd, &st) != 0) {
             const int e = errno;
+            arena_unlock(fd);
             close(fd);
             note = "cannot stat shared arena " + shared_file + ": " + std::strerror(e);
             return nullptr;
@@ -138,6 +367,7 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
         if (fresh) {
             if (ftruncate(fd, (off_t) file_bytes) != 0) {
                 const int e = errno;
+                arena_unlock(fd);
                 close(fd);
                 note = "cannot size shared arena " + shared_file + ": " + std::strerror(e);
                 return nullptr;
@@ -148,16 +378,27 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
             hdr.header_bytes = (uint32_t) kSharedArenaHeaderBytes;
             hdr.arena_bytes = bytes;
             hdr.pack_hash = shared_pack_hash;
-            const ssize_t written = pwrite(fd, &hdr, sizeof hdr, 0);
-            if (written != (ssize_t) sizeof hdr) {
+            // state stays 0: the body is EMPTY until this process writes it.  The old code wrote this header
+            // and nothing else, so a second process arriving mid-load saw a valid header, the right size and
+            // the right hash and happily read a half-written arena.  `state` is what makes that impossible.
+            hdr.owner = (uint64_t) (uint32_t) getpid();
+            hdr.nonce = make_load_nonce();
+            hdr.owner_start = proc_start_time((uint64_t) (uint32_t) getpid());
+            if (!write_arena_header(fd, hdr)) {
                 const int e = errno;
+                arena_unlock(fd);
                 close(fd);
                 note = "cannot write shared arena header " + shared_file + ": " +
-                       (written < 0 ? std::string(std::strerror(e)) : std::string("short write"));
+                       (e ? std::strerror(e) : std::string("short write"));
                 return nullptr;
             }
+            shared.role = 1;
+            shared.nonce = hdr.nonce;
+            shared.owner_pid = (uint32_t) hdr.owner;
+            shared.reason = "created and claimed by pid " + std::to_string(hdr.owner);
         } else {
             if (st.st_size < 0 || (uint64_t) st.st_size != file_bytes) {
+                arena_unlock(fd);
                 close(fd);
                 note = "shared arena " + shared_file + " is " +
                        std::to_string((unsigned long long) st.st_size) + " B, expected " +
@@ -165,15 +406,16 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
                 return nullptr;
             }
             SharedArenaHeader hdr{};
-            const ssize_t got_header = pread(fd, &hdr, sizeof hdr, 0);
-            if (got_header != (ssize_t) sizeof hdr ||
+            if (!read_arena_header(fd, hdr) ||
                 std::memcmp(hdr.magic, kSharedArenaMagic, sizeof hdr.magic) != 0 ||
                 hdr.version != 1 || hdr.header_bytes != kSharedArenaHeaderBytes || hdr.arena_bytes != bytes) {
+                arena_unlock(fd);
                 close(fd);
                 note = "shared arena " + shared_file + " has an incompatible or missing header";
                 return nullptr;
             }
             if (hdr.pack_hash != shared_pack_hash) {
+                arena_unlock(fd);
                 close(fd);
                 char b[256];
                 std::snprintf(b, sizeof b,
@@ -183,10 +425,134 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
                 note = b;
                 return nullptr;
             }
+
+            // ---- the state machine.  `state == ready` is the ONLY state a process may map and read. ----
+            //
+            // An old v1 file (state/owner/nonce all zero, because the writer had `reserved[4]` there) falls
+            // into the not-populated arm and is loaded once, then published.  That is the backward-compatible
+            // reading of "reserved == 0": it means NOT READY, never "assume somebody filled it in".
+            if (hdr.state == kSharedArenaReady) {
+                shared.role = 2;
+                shared.owner_pid = (uint32_t) hdr.owner;
+                shared.reason = "already populated by pid " + std::to_string(hdr.owner) +
+                                " (state ready, pack hash matched)";
+            } else if (hdr.owner != 0 && claim_alive(hdr.owner, hdr.owner_start)) {
+                // Somebody is loading it RIGHT NOW.  Do not re-load it (that would fight the same pages) and do
+                // not read it (it is half-written).  Wait, outside the lock, for the loader to publish.
+                //
+                // The loop follows the CURRENT claim rather than the one it started with: if the loader we were
+                // waiting on died and a third process took the load over, the header's claim changes underneath
+                // us and the correct answer is to wait on the NEW claim, not to steal it.  Only a dead or
+                // cleared claim, or an expired budget, ends the wait without a published arena.
+                arena_unlock(fd);
+                const uint64_t budget = shared_arena_wait_ms();
+                const auto t0 = std::chrono::steady_clock::now();
+                uint64_t state = 0, owner = hdr.owner, owner_start = hdr.owner_start;
+                for (;;) {
+                    SharedArenaHeader h2{};
+                    if (read_arena_header(fd, h2)) {
+                        state = h2.state;
+                        owner = h2.owner;
+                        owner_start = h2.owner_start;
+                    }
+                    if (state == kSharedArenaReady) break;
+                    if (owner == 0 || !claim_alive(owner, owner_start)) { state = 0; break; }
+                    const uint64_t waited = (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                std::chrono::steady_clock::now() - t0).count();
+                    if (waited >= budget) { shared.waited_ms = (uint32_t) waited; break; }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                }
+                shared.waited_ms = (uint32_t) std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        std::chrono::steady_clock::now() - t0).count();
+                if (state == kSharedArenaReady) {
+                    shared.role = 2;
+                    shared.owner_pid = (uint32_t) owner;
+                    shared.reason = "waited " + std::to_string(shared.waited_ms) +
+                                    " ms for pid " + std::to_string(owner) + "'s load";
+                } else {
+                    // Either the loader died, or it is still going and the wait budget ran out.  In both cases
+                    // the honest answer is "this process loads it": reading an unpopulated arena is never an
+                    // option, and a dead owner must not wedge the file forever.
+                    //
+                    // On a budget expiry two processes can then load the same arena at once.  That is wasteful
+                    // but NOT corrupting: the pack hash matched, so both write byte-identical experts to the
+                    // same offsets, and the loser's publish is refused by the nonce check in
+                    // `publish_shared_load()`.  Refusing to start instead would trade a slow second server for
+                    // no second server at all.
+                    shared.role = 1;
+                    shared.reason = "owner pid " + std::to_string(hdr.owner) +
+                                    (shared.waited_ms >= budget ? " still loading after a " + std::to_string(budget) +
+                                                                 " ms wait" : " is gone") +
+                                    "; taking the load over";
+                }
+                if (shared.role == 1) {
+                    // Re-claim under the lock, and re-check first: the loader may have published in the window
+                    // between the last header read and here.
+                    if (!arena_lock(fd, note)) { close(fd); return nullptr; }
+                    SharedArenaHeader h3{};
+                    if (read_arena_header(fd, h3) && h3.state == kSharedArenaReady) {
+                        shared.role = 2;
+                        shared.owner_pid = (uint32_t) h3.owner;
+                        shared.reason = "already populated by pid " + std::to_string(h3.owner) +
+                                        " (state ready, pack hash matched)";
+                    } else {
+                        SharedArenaHeader mine{};
+                        // Rebuilt from scratch rather than copied out of the file: if the re-read above failed we
+                        // must not write back a zeroed header and lose the arena's identity (size + pack hash).
+                        std::memcpy(mine.magic, kSharedArenaMagic, sizeof mine.magic);
+                        mine.version = 1;
+                        mine.header_bytes = (uint32_t) kSharedArenaHeaderBytes;
+                        mine.arena_bytes = bytes;
+                        mine.pack_hash = shared_pack_hash;
+                        mine.state = 0;
+                        mine.owner = (uint64_t) (uint32_t) getpid();
+                        mine.nonce = make_load_nonce();
+                        mine.owner_start = proc_start_time((uint64_t) (uint32_t) getpid());
+                        if (!write_arena_header(fd, mine)) {
+                            arena_unlock(fd);
+                            close(fd);
+                            note = "cannot claim shared arena load " + shared_file;
+                            return nullptr;
+                        }
+                        shared.nonce = mine.nonce;
+                        shared.owner_pid = (uint32_t) mine.owner;
+                    }
+                    if (shared.role == 1) shared.reason = "took over the load: " + shared.reason;
+                }
+            } else {
+                // Not populated and nobody owns it (fresh-ish file, old-engine header, or an owner that is gone).
+                SharedArenaHeader mine;
+                std::memcpy(mine.magic, kSharedArenaMagic, sizeof mine.magic);
+                mine.version = 1;
+                mine.header_bytes = (uint32_t) kSharedArenaHeaderBytes;
+                mine.arena_bytes = bytes;
+                mine.pack_hash = shared_pack_hash;
+                mine.state = 0;
+                mine.owner = (uint64_t) (uint32_t) getpid();
+                mine.nonce = make_load_nonce();
+                mine.owner_start = proc_start_time((uint64_t) (uint32_t) getpid());
+                if (!write_arena_header(fd, mine)) {
+                    arena_unlock(fd);
+                    close(fd);
+                    note = "cannot claim shared arena load " + shared_file;
+                    return nullptr;
+                }
+                shared.role = 1;
+                shared.nonce = mine.nonce;
+                shared.owner_pid = (uint32_t) mine.owner;
+                shared.reason = hdr.state == 0 && hdr.owner == 0
+                                    ? "not populated (v1 header with no load state); claimed by pid " +
+                                          std::to_string(mine.owner)
+                                    : "owner pid " + std::to_string(hdr.owner) + " is gone; claimed by pid " +
+                                          std::to_string(mine.owner);
+            }
         }
 
+        // The map happens while the lock is still held for the loader/borrower decision paths, so no process
+        // can be between "claimed" and "mapped" while another one rewrites the header underneath it.
         void* map = mmap(nullptr, (size_t) file_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         const int e = errno;
+        arena_unlock(fd);
         close(fd);
         if (map == MAP_FAILED) {
             note = "cannot map shared arena " + shared_file + ": " + std::strerror(e);
@@ -256,10 +622,26 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
                          uint64_t max_pinned_bytes, const std::string& shared_file,
                          uint64_t shared_pack_hash) : capacity(bytes) {
     if (bytes == 0) return;
-    base = reserve(bytes, backing, note, shared_file, shared_pack_hash, mapping_base, mapping_bytes);
+    SharedReservation shared;
+    base = reserve(bytes, backing, note, shared_file, shared_pack_hash, mapping_base, mapping_bytes, shared);
     if (base != nullptr && mapping_base == nullptr) {
         mapping_base = base;
         mapping_bytes = bytes;
+    }
+    const bool is_shared_file = base != nullptr && !shared_file.empty();
+    if (is_shared_file) {
+        shared_file_ = shared_file;
+        this->shared_pack_hash = shared_pack_hash;
+        shared_load_nonce = shared.nonce;
+        shared_owner_pid = (uint32_t) shared.owner_pid;
+        shared_waited_ms = shared.waited_ms;
+        shared_borrowed = shared.role == 2;
+        shared_load_owner = shared.role == 1;
+        // Say WHAT THE ENGINE GOT, not what it asked for: "borrowed" is the whole point of the feature (no
+        // second 46.84 GiB read), and "owner" is what tells the operator which process is still loading.
+        note = (shared_borrowed ? "SHARED ARENA BORROWED, experts not re-loaded [" + shared.reason + "]"
+                                : "SHARED ARENA OWNER, caller must load the arena [" + shared.reason + "]") +
+               "; " + note;
     }
 
     // Register with CUDA BEFORE any page is touched: cudaHostRegister pins what is resident now, and a region
@@ -294,10 +676,14 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
             if (registered_bytes < bytes) {
                 const char* env = std::getenv("STRATA_ARENA_LOCK");
                 if (env == nullptr || std::string(env) != "0") {
-                    const strata::platform::LockResult lr =
-                        strata::platform::lock_resident((uint8_t*) base + registered_bytes, bytes - registered_bytes);
-                    locked_bytes = lr.locked_bytes;
-                    note = lr.note + "; " + note;
+                    if (is_shared_file) {
+                        note = lock_skipped_for_shared_file_note() + "; " + note;
+                    } else {
+                        const strata::platform::LockResult lr =
+                            strata::platform::lock_resident((uint8_t*) base + registered_bytes, bytes - registered_bytes);
+                        locked_bytes = lr.locked_bytes;
+                        note = lr.note + "; " + note;
+                    }
                 }
             }
         } else {
@@ -320,9 +706,13 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
             // special privilege. STRATA_ARENA_LOCK=0 is the A/B arm.
             const char* env = std::getenv("STRATA_ARENA_LOCK");
             if (env == nullptr || std::string(env) != "0") {
-                const strata::platform::LockResult lr = strata::platform::lock_resident(base, bytes);
-                locked_bytes = lr.locked_bytes;
-                note = lr.note + "; " + note;
+                if (is_shared_file) {
+                    note = lock_skipped_for_shared_file_note() + "; " + note;
+                } else {
+                    const strata::platform::LockResult lr = strata::platform::lock_resident(base, bytes);
+                    locked_bytes = lr.locked_bytes;
+                    note = lr.note + "; " + note;
+                }
             } else {
                 note = "arena lock disabled (STRATA_ARENA_LOCK=0); " + note;
             }
@@ -330,7 +720,95 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
     }
 }
 
+bool PinnedArena::publish_shared_load(std::string* why) {
+    const char* bad = nullptr;
+#ifndef _WIN32
+    if (!base || shared_file_.empty()) bad = "the arena has no shared-file backing";
+    else if (!shared_load_owner) bad = "this process does not own the shared arena load";
+    else if (shared_load_nonce == 0) bad = "the shared arena load was never claimed";
+    else {
+        // The body was written through MAP_SHARED pages by other threads; publish the READY flag through a
+        // different path (pwrite on the fd), so the ordering is not automatic.  A release fence before the
+        // store is what makes "state == ready" mean "every byte of the body is already visible" to the next
+        // process - without it, a borrower can see the flag and still read a hole.
+        std::atomic_thread_fence(std::memory_order_release);
+        const int fd = open(shared_file_.c_str(), O_RDWR | O_CLOEXEC);
+        if (fd < 0) {
+            bad = "cannot reopen the shared arena to publish it";
+        } else {
+            // Publish ONLY if this process still owns the claim.  If the owner died and somebody else took the
+            // load over, this process's bytes are stale and marking them ready would hand a half-written arena
+            // to every later process - the exact bug the protocol exists to fix.
+            SharedArenaHeader hdr{};
+            uint64_t owner = 0, nonce = 0;
+            if (read_arena_header(fd, hdr)) { owner = hdr.owner; nonce = hdr.nonce; }
+            if (nonce != shared_load_nonce) {
+                close(fd);
+                shared_load_owner = false;
+                shared_owner_pid = (uint32_t) owner;
+                note = "shared arena load NOT published: its header is now claimed by pid " +
+                       std::to_string(owner) + " (this process's claim was taken over); " + note;
+                bad = "this process no longer owns the shared arena load";
+            } else {
+                hdr.state = kSharedArenaReady;
+                hdr.owner = (uint64_t) (uint32_t) getpid();
+                hdr.nonce = shared_load_nonce;
+                const bool ok = write_arena_header(fd, hdr);
+                close(fd);
+                if (!ok) {
+                    shared_load_owner = false;
+                    note = "shared arena load NOT published (header write failed); " + note;
+                    bad = "the shared arena header write failed";
+                } else {
+                    shared_load_owner = false;   // published: the arena is now borrowable, by us included
+                    shared_borrowed = true;
+                    shared_owner_pid = (uint32_t) getpid();
+                    if (why) why->clear();
+                    // The ctor's note said "SHARED ARENA OWNER, caller must load the arena", which was true
+                    // then and is stale now: the driver prints `note()` AFTER the caller has loaded and
+                    // published, so leaving it reads as an instruction nobody still has to follow.
+                    {
+                        const std::string must = "SHARED ARENA OWNER, caller must load the arena [";
+                        const size_t at = note.find(must);
+                        if (at != std::string::npos)
+                            note.replace(at, must.size(), "SHARED ARENA PUBLISHED, other processes can borrow it [");
+                        else
+                            note = "SHARED ARENA PUBLISHED, other processes can borrow it; " + note;
+                    }
+                    return true;
+                }
+            }
+        }
+    }
+#else
+    bad = "shared-file arena backing is not implemented on Windows";
+#endif
+    if (why && bad) *why = bad;
+    return false;
+}
+
 PinnedArena::~PinnedArena() {
+    // A load that was claimed but never published must release its claim.  Without this, a process that gave up
+    // on the arena (a refused expert load, a `--mmap-experts` fallback, an exception) but keeps RUNNING leaves a
+    // header naming a LIVE pid, and every other process then waits out the whole wait budget for a load that is
+    // never coming.  Clearing owner makes the next process take the load over immediately.
+    // (Windows never reaches this state: the shared-file branch refuses the arena before it can claim a load.)
+#ifndef _WIN32
+    if (shared_load_owner && !shared_file_.empty() && shared_load_nonce != 0) {
+        const int fd = open(shared_file_.c_str(), O_RDWR | O_CLOEXEC);
+        if (fd >= 0) {
+            SharedArenaHeader hdr{};
+            if (read_arena_header(fd, hdr) && hdr.nonce == shared_load_nonce) {
+                hdr.state = 0;
+                hdr.owner = 0;
+                hdr.nonce = 0;
+                (void) write_arena_header(fd, hdr);
+            }
+            close(fd);
+        }
+    }
+#endif
+    shared_load_owner = false;
     if (base) {
         if (locked_bytes) strata::platform::unlock_resident((uint8_t*) base + (slice_bytes ? registered_bytes : 0), locked_bytes);
         if (slice_bytes) {

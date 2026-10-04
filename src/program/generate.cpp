@@ -49,6 +49,11 @@
 #include "strata/core/native_dense.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
+#include "strata/program/prefill_loan.hpp"
+#include "strata/program/serve_proto.hpp"   // S3.1c: the --serve wire format, in one place
+#include "strata/program/slot.hpp"          // S3.1b: the slot object / state machine / pick()
+#include "strata/program/serve_swap.hpp"    // S3.1d: mount/unmount a slot in the one live session
+#include "strata/program/serve_driver.hpp"  // S3.1e-2: the concurrent driver's decisions (admission, step dispatch, loan, watchdog)
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/kernels/cvec.hpp"
@@ -98,6 +103,86 @@ namespace {
 bool refill_blocking() {
     static const bool v = std::getenv("STRATA_REFILL_BLOCKING") != nullptr;
     return v;
+}
+
+// ---- S0.3: the --serve prefill FIXED COST (see include/strata/program/prefill_loan.hpp and
+// bench/prefill/fixed-cost-changes.md).  Measured on this box over 1 600 live requests:
+// `prompt_ms ~= 9 500 fixed + 2.7 * fresh`, and the fixed term does not scale with the cached context, so
+// it is per-request overhead around the read - the expert-cache loan the prompt path takes and gives back.
+// Every switch below defaults to the NEW behaviour and reverts to today's when set; all are read once at
+// startup, like every other STRATA_* knob.
+//
+// STRATA_PREFILL_STICKY_LOAN=0: hand the loan back and re-take it (with a `Prefill::relayout`) even when
+// the next segment needs exactly the layout that is still lying in the cache.
+bool sticky_loan() {
+    static const bool v = [] {
+        const char* e = std::getenv("STRATA_PREFILL_STICKY_LOAN");
+        return e == nullptr || std::atoi(e) != 0;
+    }();
+    return v;
+}
+// STRATA_RES_UPLOAD_ALWAYS=1: re-upload the residency table on every lend/refill whether or not its
+// content changed.  The skip is a content comparison against what was last uploaded, so it cannot miss a
+// change; this is the A/B arm, not a safety valve.
+bool res_upload_always() {
+    static const bool v = std::getenv("STRATA_RES_UPLOAD_ALWAYS") != nullptr;
+    return v;
+}
+// STRATA_PREFILL_LOAN_TIMING=1: one stderr line per lend and per refill, so the loan's cost is measurable
+// from the serve log instead of inferred from the source (the log has no lend/refill timer today).
+// S3.2b extends it: a refill line now says EAGER or LAZY, each pump batch prints its own line, and the
+// per-request line splits the rows into eagerly refilled / pumped home / still out of the cache.
+bool loan_timing() {
+    static const bool v = std::getenv("STRATA_PREFILL_LOAN_TIMING") != nullptr;
+    return v;
+}
+
+// ---- S3.2b: the loan goes back LAZILY (include/strata/program/prefill_loan.hpp, lever 5). -------------
+// The 4.95 GiB per stage that `refill()` streamed back at the end of every prompt is the largest remaining
+// prefill fixed cost, and S0.3 named it as the floor that only concurrency could remove.  It is not a
+// correctness requirement: `kNotResident` is a legal state the decode path already handles (a verify window
+// routes an expert, finds the row non-resident and sends that row to the CPU pool).  So the rows can stay
+// out, come back in bounded batches between decode steps, or come back never.
+//
+// STRATA_PREFILL_LAZY_LOAN: `auto` (unset, the default) = on under the concurrent driver (--serve-slots >= 2
+// with the slot hand-over and the conversation cache both live), off on the serial path, which therefore
+// stays 0.1.30's byte-for-byte.  `=1` forces it on everywhere (the A/B arm for --serve-slots 0/1), `=0`
+// forces it off everywhere.
+//
+// WHY THE DEFAULT IS GATED AND NOT SIMPLY "on".  Lazy return is not only a timing change: a row that is
+// still out of the cache is computed by the CPU instead of the GPU, and the two round differently
+// (expert_cache.hpp's parity note - the same caveat the cache itself ships with).  The serial path's
+// acceptance bar is bit-exactness against 0.1.30, so the default keeps that bar and the switch lets the
+// owner measure the lazy path there.  Under the concurrent driver that bar is already crossed by the swap
+// itself, and the loan is a process resource, which is where the saving is.
+int lazy_loan_env() {           // 1 = forced on, 0 = forced off, -1 = auto (concurrent driver only)
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_PREFILL_LAZY_LOAN");
+        if (e == nullptr) return -1;
+        return (std::atoi(e) != 0) ? 1 : 0;
+    }();
+    return v;
+}
+// STRATA_PREFILL_LOAN_PUMP_ROWS N: expert rows per cache that the overlapped pump may have in flight at a
+// time (default 16; 0 = never pump, so a ledger is only drained by an eager refill).  Bounded, and one
+// batch per cache at a time, on purpose: the copies run on their own non-blocking stream beside the decode
+// steps, and an unbounded queue would put a multi-gigabyte DMA in front of the next window.  The bound is
+// also what throttles the pump by itself - if a batch has not landed by the next window, no new one is
+// queued - so N is a ceiling on queue depth, not a rate: the effective rate is N rows per
+// max(window time, the batch's DMA time).
+//
+// 16 rows is ~30 MiB per cache.  On this box's links that is ~23 ms of DMA on CUDA1 (1.3 GB/s) and ~10 ms
+// on CUDA0 (2.9 GB/s) - about one verify window - so a batch is normally in flight continuously without
+// ever queueing more than a window's worth behind the GPU.  It is NOT free: that DMA shares PCIe with the
+// decode path's own streamed experts and its KV reads.  Raise it to recover the decode hit rate faster;
+// set it to 0 to leave the cold rows on the CPU pool for the whole request (the cheapest prompt, and the
+// slowest decode if the conversation then runs long).
+int64_t loan_pump_rows() {
+    static const int64_t v = [] {
+        const char* e = std::getenv("STRATA_PREFILL_LOAN_PUMP_ROWS");
+        return e != nullptr ? (int64_t) std::atoll(e) : (int64_t) 16;
+    }();
+    return v < 0 ? 0 : v;
 }
 
 using Clock = std::chrono::steady_clock;
@@ -239,7 +324,16 @@ struct Options {
     /// is reserved for a host thread that has nothing to do while the drain runs.
     bool no_host_worker = false;
     bool mmap_experts = false;    ///< R2.1: opt OUT of the resident arena, back to MapViewOfFile
-    std::string shared_expert_arena; ///< Linux: optional file backing for the resident arena shared by processes
+    /// Linux: file backing for the resident arena, shared by the processes on the machine.  The first process to
+    /// claim it loads the experts; the rest map the same bytes (core/pinned.cu).  ON by default where it exists:
+    /// two servers on one PC should hold ONE copy of 47 GiB of experts, not two.  Empty on Windows, where the
+    /// shared backing is not implemented and a non-empty default would refuse every start.
+#ifdef _WIN32
+    std::string shared_expert_arena;
+#else
+    std::string shared_expert_arena = "/dev/shm/shared_experts.dat";
+#endif
+    bool shared_expert_arena_given = false;   ///< an explicit --shared-expert-arena is obeyed, a default is not
     bool resident_cpu_experts = false; ///< mmap-backed static-cache misses copied into ordinary RAM
     /// `--resident-experts` (the low-RAM PC's resident mode, chosen by setup): `--resident-cpu-experts` with the copy
     /// page-locked when the driver allows (else locked in the working set), 4 GiB of RAM headroom, and plain mmap
@@ -339,6 +433,38 @@ struct Options {
     std::string split_device;
     /// Plan v0.3 P8: stay resident and take requests on stdin (see the --serve block in main).
     bool serve = false;
+    /// S3.1b/S3.1c/S3.1e-2 (--serve-slots N): how many conversations may be ACTIVE at once inside this
+    /// process.  0 (the default) or 1 = today's serial engine, byte-identical on the wire: no `#<id>`
+    /// tags, no `SLOT` lines, and `READY` does not advertise `slots=`.  >= 2 turns the stage-3 protocol
+    /// on (include/strata/program/serve_proto.hpp, docs/STAGE3-CONCURRENCY.md §6) AND the concurrent
+    /// driver: the serve loop admits requests into the slot registry and runs ONE step of ONE slot per
+    /// iteration (`run_prefill_step` = a prompt segment, `run_decode_step` = a verify window), handing
+    /// the session between conversations through S3.1d's `swap_to`.  It needs a conversation cache:
+    /// a slot switch IS a save/restore, so with parking off the engine falls back to the serial driver
+    /// (and says so).  The GPU is still serialised - one engine thread issues windows - so what improves
+    /// is latency and the fixed cost of prompt reads, not tokens per second.
+    int serve_slots = 0;
+    /// S3.1b (--starve-ms): the fairness bound of the pick rule (§3.3) - how long a slot may wait for the
+    /// session before the scheduler swaps to it.  0 = never force a swap.  Tuning it is a measurement
+    /// (OQ4), not a guess; the default is the design's starting point.
+    int64_t starve_ms = 250;
+    /// S3.10 (--decode-tokens N): how many tokens a slot may GENERATE on its turn before the scheduler
+    /// may take the session away.  A decode step used to be exactly one verify window, which with MTP
+    /// accepts 1..8 tokens - so a slot emitted ~1-3 tokens and then paid a full save+restore to hand
+    /// the session to the next conversation (risk R10: the swap is 237 MB-2.25 GB of memcpy).  N is a
+    /// budget in tokens, not windows: the driver runs windows back-to-back for this slot until it has
+    /// produced N, EOS, `--max-new`, or a STOP.  0/1 = today's one-window-per-turn behaviour.
+    int64_t decode_tokens = 0;
+    /// S4.2 (--hold-ms N): how long a request the engine cannot run yet may WAIT before it is answered
+    /// with an error.  Stage 4's "hold, don't reject": a request that is blocked by something that
+    /// comes back - every slot busy, no free RAM, the mounted conversation mid-read, another slot
+    /// holding the prompt loan - is queued and started when the resource frees, instead of getting an
+    /// `ERR` on the spot.  Only a request that can NEVER run (a prompt past --max-context, a
+    /// conversation whose snapshot exceeds the whole parking budget, --serve-slots >= 2 with parking
+    /// off) is an error immediately.  N is the bound on the wait; 0 = wait forever, so only `STOP <id>`
+    /// or the client's disconnect ends it.  The default is minutes, not seconds: the worst real queue
+    /// on this box is a couple of 36 k-token prompt reads (~70 s each).
+    int64_t hold_ms = 600000;
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
     bool vision = false;
     int adapt_swaps = 96;
@@ -346,8 +472,18 @@ struct Options {
     /// prompt again, the v0.1.2 behaviour).  One is the GDN recurrence of the 36 layers, the QSA indexer tails and
     /// the PLE history (~118 MB of host RAM); the KV cache itself is positional and stays where it is.
     int prompt_cache = 6;
-    int64_t conversation_cache_mib = 0; // opt-in host RAM for independent conversations
-    int conversation_cache_slots = 4;
+    /// --serve: host RAM the PARKED PREFIX cache may hold (see core/conversation_cache.hpp).  Stage 2 of the
+    /// concurrency work: a client that switches between prompts - an agent that spawns subagents, each with its
+    /// own system prompt - must not rebuild a prefix it will need again, so several prefixes live at once.
+    /// Parking only saves the re-read; requests are still served one at a time (stage 3 is not implemented).
+    /// 0 = park nothing (the behaviour before parking was on by default).  A cap, not a reservation:
+    /// `conversation_cache_min_free_mib`
+    /// below refuses to park when the machine cannot afford it.
+    int64_t conversation_cache_mib = 8192;
+    bool conversation_cache_mib_given = false;   ///< an explicit budget is never second-guessed by the machine-sized default
+    /// How many prefixes may be parked at once.  Pruned least-recently-used first, so a prefix a client keeps
+    /// mounting survives however many new ones arrive.
+    int conversation_cache_slots = (int) strata::core::ConversationCache::default_slots;
     int64_t conversation_cache_min_free_mib = 2560;
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
     int64_t prompt_cache_every = 16384;
@@ -451,10 +587,43 @@ void usage() {
                  "  --shared-late        A/B: shared expert after the CPU pool (default: overlapped with it)\n"
                  "  --keep-canonical     A/B: also load canonical copies of natively served tensors (more VRAM)\n"
                  "  --vision             --serve takes images too (GENI requests; embeddings from strata-vision)\n"
+                 "  --serve-slots N      --serve: how many conversations may be ACTIVE at once (default 0 = today's\n"
+                 "                       serial engine, byte-identical on the wire).  2..8 turn on the stage-3 wire:\n"
+                 "                       READY gains slots=N, every per-request line gains #<id>, STOP can name a\n"
+                 "                       request, and the engine emits SLOT transition lines for /slots.  Each active\n"
+                 "                       slot past the first costs a parked conversation's worth of host RAM plus a\n"
+                 "                       session's worth of KV streaming state, so refuse rather than overcommit\n"
+                 "                       (docs/STAGE3-CONCURRENCY.md §2.3, risks R1/R2)\n"
+                 "  --starve-ms N        --serve-slots >= 2: how long a conversation may wait for the session before\n"
+                 "                       the scheduler swaps to it (default 250; 0 = never force a swap).  A swap is\n"
+                 "                       a save+restore of the whole conversation, so this trades fairness against\n"
+                 "                       memcpy: 8-15 s per prompt chunk against ~24 ms per decode window\n"
+                  "  --decode-tokens N    --serve-slots >= 2: how many tokens a conversation may GENERATE on its turn\n"
+                  "                       before the scheduler may hand the session to the next one (default 0 = one\n"
+                  "                       verify window per turn, which with MTP is ~1-3 tokens).  N is a token budget,\n"
+                  "                       not a window count: the slot keeps running windows until it has produced N,\n"
+                  "                       hits EOS, reaches --max-new, or is STOPped.  Raise it to cut swap churn\n"
+                  "                       (each swap is a full save+restore, risk R10); lower it for fairer interleaving\n"
+                  "  --hold-ms N          --serve-slots >= 2: how long a request the engine cannot run YET may WAIT\n"
+                  "                       before it is answered with an error (default 600000 = 10 minutes; 0 = wait\n"
+                  "                       forever, so only STOP or the client's disconnect ends it).  Stage 4's\n"
+                  "                       `hold, don't reject`: a request blocked by something that comes back - every\n"
+                  "                       slot busy, no free RAM for another conversation, the mounted conversation\n"
+                  "                       mid-read, another slot holding the prompt loan, an image request running\n"
+                  "                       alone - is QUEUED and started when the resource frees, not refused.  Only a\n"
+                  "                       request that can NEVER run is an error on the spot: a prompt past\n"
+                  "                       --max-context, a conversation whose snapshot would exceed the whole parking\n"
+                  "                       budget, or --serve-slots >= 2 with the conversation cache off.  Every wait\n"
+                  "                       shows up as `waiting=N` in the activity line, on WAIT lines, and in\n"
+                  "                       serve/server.py's /status, /slots and /metrics\n"
                  "  --prompt-cache N     --serve: keep N conversation checkpoints between requests (default 6, ~118 MB\n"
                  "                       of RAM each; 0 = read every prompt from the start)\n"
-                 "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default 0 = off)\n"
-                 "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
+                 "  --conversation-cache-mib N  --serve: RAM budget for PARKED PREFIXES (default 8192; 0 = park none)\n"
+                 "                       a parked conversation costs what it actually holds, never what\n"
+                 "                       --max-context allows it to grow to; the startup line prints the rate\n"
+                 "  --conversation-cache-slots N  --serve: how many prefixes may be parked at once (default 8);\n"
+                 "                       the least recently used one is pruned first, so a prefix a client keeps\n"
+                 "                       mounting survives however many new ones arrive\n"
                  "  --conversation-cache-min-free-mib N  --serve: physical RAM floor when parking (default 2560)\n"
                  "  --prompt-cache-every N  --serve: also checkpoint every N fresh prompt tokens (default 16384, 0 = off)\n"
                  "  --turn-token ID      --serve: the token that opens a chat turn (default 248045, <|im_start|>)\n"
@@ -472,6 +641,59 @@ void usage() {
                  "  --no-fused-gr        A/B: the six-kernel hyper-connection read and a separate write (native)\n"
                  "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (needs --native); auto =\n"
                  "                       the largest chunk up to 8192 whose buffers the expert cache can lend\n"
+                 "                       --serve: the prompt path BORROWS expert-cache slots for its chunk buffers\n"
+                 "                       and gives them back after the read.  That loan, not the read, is most of\n"
+                 "                       the per-request fixed cost (bench/prefill/README.md).  Its knobs are env,\n"
+                 "                       read once at startup; the behaviour ones default to the cheaper form,\n"
+                 "                       and each reverts to the old one when set:\n"
+                 "                         STRATA_PREFILL_STICKY_LOAN=0  hand the loan back and re-take it even\n"
+                 "                                 when the next segment needs the layout still lying in the cache\n"
+                 "                         STRATA_RES_UPLOAD_ALWAYS=1  re-upload the residency table on every lend\n"
+                 "                                 and refill whether or not its content changed\n"
+                 "                         STRATA_PREFILL_LOAN_TIMING=1  one stderr line per lend and per refill,\n"
+                 "                                 so the loan's cost is readable from the serve log.  S3.2b\n"
+                 "                                 extends it: a refill line says EAGER or LAZY, each pump batch\n"
+                 "                                 prints its own, and the per-request line splits the rows into\n"
+                 "                                 refilled / out / pumped home / still out of the cache\n"
+                 "                         STRATA_PREFILL_LAZY_LOAN  --serve: give the prompt loan back LAZILY.\n"
+                 "                                 Unset (the default) = on under the concurrent driver\n"
+                 "                                 (--serve-slots >= 2 with the slot hand-over and the parking\n"
+                 "                                 cache both live), off on the serial path, which stays 0.1.30's\n"
+                 "                                 byte for byte.  =1 forces it on everywhere (the A/B arm), =0\n"
+                 "                                 forces it off.  The end-of-request refill - 4.95 GiB per stage\n"
+                 "                                 here, ~3.8 s on the slowest link - stops being a prompt cost:\n"
+                 "                                 the rows stay marked non-resident (decode runs them on the CPU\n"
+                 "                                 pool, which is correct), the layout and the ledger survive into\n"
+                 "                                 the NEXT request, and a bounded pump walks the hottest rows\n"
+                 "                                 home between decode steps.  A row is marked resident only after\n"
+                 "                                 its copy is confirmed landed, so no window ever reads a slot\n"
+                 "                                 that does not hold its expert.  Not only a timing change: a row\n"
+                 "                                 still out is computed by the CPU instead of the GPU, and the\n"
+                 "                                 two round differently (see --expert-cache's parity note)\n"
+                 "                         STRATA_PREFILL_LOAN_PUMP_ROWS N  expert rows per cache the pump may\n"
+                 "                                 have in flight at a time (default 8; 0 = never pump, so a\n"
+                 "                                 ledger is only drained when something needs the cache whole)\n"
+                 "                         STRATA_PARK_REFUSALS N / STRATA_PARK_QUIET N  after N consecutive\n"
+                 "                                 RAM-admission parking refusals, stop estimating for N requests\n"
+                 "                                 (defaults 3 and 64; STRATA_PARK_REFUSALS=0 always asks)\n"
+                 "                         STRATA_NO_SWAP=1  --serve-slots >= 2: never hand the session to another\n"
+                 "                                 conversation.  The wire stays id-tagged, but every request runs\n"
+                 "                                 against the one mounted slot - 0.1.30's serial behaviour, no\n"
+                 "                                 recompile.  A swap that does run prints the bytes it moved and\n"
+                 "                                 its ms on stderr; INFO reports `slot_swap=0|1`\n"
+                 "                         STRATA_SERVE_TRACE=1  --serve-slots >= 2: one stderr line per scheduler\n"
+                 "                                 decision - every pick with `Pick::why`, every slot phase\n"
+                 "                                 transition, every swap with the reason it was asked for, and every\n"
+                 "                                 loan/parking deferral.  Off by default so the normal log stays\n"
+                 "                                 readable.  The parking numbers, `resumed from N tokens` and\n"
+                 "                                 `re-reading from token 0` are unconditional (one line per decision)\n"
+                 "                                 because they are the ones that explain a request that ended early\n"
+                 "                         STRATA_SERVE_ACTIVITY_S N  --serve-slots >= 2: print the periodic\n"
+                 "                                 `activity:` line every N seconds (default 30; 0 = only when the\n"
+                 "                                 active set changes).  `slots_active` prints only on a CHANGE, so a\n"
+                 "                                 run that never got past one conversation looks identical to one\n"
+                 "                                 that was idle; the activity line carries `peak=`, which tells them\n"
+                 "                                 apart\n"
                  "  --no-pool            skip the CPU expert pool (the GPU-only floor)\n"
                  "  --sync-every-layer   debug: synchronise after every layer\n"
                  "  --ple-gguf PATH      the n-gram/PLE shard.  WITHOUT IT LAYER 1's PLE IS SILENTLY SKIPPED,\n"
@@ -1088,6 +1310,10 @@ int main(int argc, char** argv) {
         else if (a == "--split-device") o.split_device = next("--split-device");
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
         else if (a == "--serve") o.serve = true;
+        else if (a == "--serve-slots") o.serve_slots = std::atoi(next("--serve-slots"));
+        else if (a == "--starve-ms") o.starve_ms = std::atoll(next("--starve-ms"));
+        else if (a == "--decode-tokens") o.decode_tokens = std::atoll(next("--decode-tokens"));
+        else if (a == "--hold-ms") o.hold_ms = std::atoll(next("--hold-ms"));
         else if (a == "--vision") o.vision = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
@@ -1100,7 +1326,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "%s needs a nonnegative integer within range\n", a.c_str());
                 return 2;
             }
-            if (a == "--conversation-cache-mib") o.conversation_cache_mib = number;
+            if (a == "--conversation-cache-mib") { o.conversation_cache_mib = number; o.conversation_cache_mib_given = true; }
             else if (a == "--conversation-cache-min-free-mib") o.conversation_cache_min_free_mib = number;
             else o.conversation_cache_slots = (int) number;
         }
@@ -1155,7 +1381,7 @@ int main(int argc, char** argv) {
         else if (a == "--expert-profile") o.expert_profile = next("--expert-profile");
         else if (a == "--gpu-stages") o.gpu_stages = true;
         else if (a == "--mmap-experts") o.mmap_experts = true;
-        else if (a == "--shared-expert-arena") o.shared_expert_arena = next("--shared-expert-arena");
+        else if (a == "--shared-expert-arena") { o.shared_expert_arena = next("--shared-expert-arena"); o.shared_expert_arena_given = true; }
         else if (a == "--resident-cpu-experts") o.resident_cpu_experts = true;
         else if (a == "--resident-experts") {
             o.mmap_experts = o.resident_cpu_experts = o.resident_pin = o.resident_soft = true;
@@ -1188,10 +1414,72 @@ int main(int argc, char** argv) {
     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
         std::fprintf(stderr, "strata serve: warning: conversation caching is disabled by %s\n",
                      o.prompt_cache == 0 ? "--prompt-cache 0" : "--conversation-cache-slots 0");
-    if (o.conversation_cache_mib > 0 && o.conversation_cache_slots > 0 && o.prompt_cache > 0 && !o.layer_split.empty()) {
-        std::fprintf(stderr, "strata serve: conversation parking does not yet support --layer-split; disable parking with --conversation-cache-mib 0\n");
+    // S3.1b/S3.1c: --serve-slots.  0/1 = today's serial engine.  The ceiling is the registry's, and the
+    // reason to REFUSE rather than over-commit is risk R1/R2 of docs/STAGE3-CONCURRENCY.md: every active
+    // slot past the first costs ~1.4 GiB of VRAM-side session state and ~6.3 GiB of host RAM on the box
+    // this is sized against, and under WDDM a full GPU does not fail, it pages - which stalls a verify
+    // graph spinning on a host flag forever.
+    if (o.serve_slots < 0 || o.serve_slots > (int) strata::program::slot::kMaxActive) {
+        std::fprintf(stderr, "--serve-slots needs 0..%d (0 = today's serial engine)\n",
+                     (int) strata::program::slot::kMaxActive);
+        usage();
         return 2;
     }
+    // S3.1e-2, risks R2/R12: a slot switch IS a save/restore (§5.3), and the save is the conversation
+    // cache.  With parking off there is nothing to save, so "two slots" would mean two conversations
+    // overwriting one session - plausible garbage, not concurrency.  Refuse rather than over-commit,
+    // and refuse HERE, before the model load, so the owner is not made to wait a minute for the bad
+    // news.  (The other way to end up with no budget - the machine-sized default rounding to zero - is
+    // caught below, where that budget is computed.)
+    if (o.serve && o.serve_slots >= 2 &&
+        (o.prompt_cache == 0 || o.conversation_cache_slots == 0 || o.conversation_cache_mib == 0)) {
+        std::fprintf(stderr, "--serve-slots %d needs a conversation cache: a slot switch saves one "
+                             "conversation out and restores another (docs/STAGE3-CONCURRENCY.md §5.3), and "
+                             "parking is off (--prompt-cache %lld, --conversation-cache-mib %lld or "
+                             "--conversation-cache-slots %d). Use --serve-slots 0/1 for today's serial "
+                             "engine, or give the cache a budget.\n",
+                     o.serve_slots, (long long) o.prompt_cache, (long long) o.conversation_cache_mib,
+                     o.conversation_cache_slots);
+        usage();
+        return 2;
+    }
+    // The same trap reached a different way: the DEFAULT budget is capped to the machine (stage 2), so
+    // on a box with no RAM to spare `--conversation-cache-mib 8192` still resolves to 0 and parking is
+    // off anyway.  Refuse that here too rather than after a minute of model loading.  An explicit
+    // --conversation-cache-mib is never second-guessed, so it is not re-checked.
+    if (o.serve && o.serve_slots >= 2 && !o.conversation_cache_mib_given && o.conversation_cache_mib > 0) {
+        const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
+        const uint64_t headroom = 4ull << 30;   // the same figure the default cap uses (generate.cpp's park budget)
+        if (const auto avail = strata::core::conversation_available_memory();
+            avail.has_value() && *avail <= floor + headroom) {
+            std::fprintf(stderr, "--serve-slots %d needs somewhere to park a conversation: this machine has "
+                                 "%.1f GiB free, which is under the %.1f GiB parking floor plus %.1f GiB of "
+                                 "request headroom, so the parked-prefix budget resolves to 0 and a slot switch "
+                                 "would have nothing to save. Free RAM, set --conversation-cache-mib N, or use "
+                                 "--serve-slots 0/1.\n",
+                         o.serve_slots, (double) *avail / 1073741824.0, (double) floor / 1073741824.0,
+                         (double) headroom / 1073741824.0);
+            return 2;
+        }
+    }
+    if (o.starve_ms < 0) { std::fprintf(stderr, "--starve-ms needs a nonnegative integer\n"); return 2; }
+    // S3.10: the per-turn decode budget.  0 = today's one window per turn; a negative value is a typo
+    // for 0, and an absurd one (larger than any request can ask for) would make a slot hold the session
+    // until its own --max-new, which is the serial engine wearing a slot costume.  The cap is the
+    // context window: no request can produce more tokens than that.
+    if (o.decode_tokens < 0) { std::fprintf(stderr, "--decode-tokens needs a nonnegative integer\n"); return 2; }
+    if (o.hold_ms < 0) { std::fprintf(stderr, "--hold-ms needs a nonnegative integer (0 = wait forever)\n"); return 2; }
+    if (o.serve && o.serve_slots >= 2 && o.decode_tokens > (int64_t) o.max_context) {
+        std::fprintf(stderr, "--decode-tokens %lld is larger than --max-context %lld: a slot would hold the "
+                             "session for its whole answer. Use a smaller value (or 0 for one window per turn).\n",
+                     (long long) o.decode_tokens, (long long) o.max_context);
+        return 2;
+    }
+    // Parking across a `--layer-split` (S3.1a): a parked conversation now carries every stage's
+    // running state and K/V plus the MTP draft state, so a split parks like one GPU does. There is
+    // deliberately no guard here any more - the split's stage set is handed to the snapshot calls
+    // below, and if it did not tile the model the snapshot core refuses rather than parking a
+    // conversation with state missing from it. `--conversation-cache-mib 0` still parks nothing.
     // Layer split (multi-GPU): the later stages run layers [K_i, K_i+1) on their own GPUs (--split-device, default
     // the next visible ones); "auto" places the K from each GPU's free VRAM once the weights are in (below).  Across
     // GPUs, not yet: KV streaming, images, control vectors, the helper caches (--expert-cache-remote), and lending
@@ -1244,8 +1532,18 @@ int main(int argc, char** argv) {
     }
     const bool multi_gpu = !split_devs.empty() && !split_same;
     if (o.mmap_experts && !o.shared_expert_arena.empty()) {
-        std::fprintf(stderr, "strata generate: --shared-expert-arena backs the resident arena and cannot be used with --mmap-experts\n");
-        return 2;
+        // **THE SHARED ARENA BACKS THE RESIDENT ARENA, AND `--mmap-experts` HAS NONE.**  The mmap path reads the
+        // pack's `experts.bin` through the OS file cache instead of holding a copy in RAM - which is what the
+        // low-RAM mode does (`setup.py` passes `--resident-experts`, and that implies `--mmap-experts`).  Now
+        // that the shared backing is ON by default, treating the two as a contradiction would stop every
+        // low-RAM install from starting at all, over an option that simply does not apply to it.  So a DEFAULT
+        // shared arena is quietly dropped when there is no resident arena to share; an EXPLICIT one is still a
+        // contradiction the user should hear about.
+        if (o.shared_expert_arena_given) {
+            std::fprintf(stderr, "strata generate: --shared-expert-arena backs the resident arena and cannot be used with --mmap-experts\n");
+            return 2;
+        }
+        o.shared_expert_arena.clear();
     }
     if (o.resident_cpu_experts && (!o.mmap_experts || o.expert_profile.empty())) {
         std::fprintf(stderr, "strata generate: --resident-cpu-experts requires --mmap-experts and a static --expert-profile\n");
@@ -2285,9 +2583,17 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::fprintf(stderr, "strata generate: expert arena: %s\n", arena_src.note().c_str());
-        std::fprintf(stderr, "strata generate: loaded %.2f GiB at %.2f GiB/s\n",
-                     (double) strata::kernels::cpu::expert_layout().total / (1024.0 * 1024 * 1024),
-                     arena_src.load_gib_per_second());
+        // A BORROWED ARENA LOADED NOTHING, and `load_gib_per_second()` is 0.0 for it.  Printing the rate line
+        // anyway reads as "46.84 GiB at 0.00 GiB/s" - a catastrophic disk - when in fact the second server did
+        // the smart thing and mapped the bytes the first one already wrote.  Say which of the two happened.
+        if (arena_src.borrowed())
+            std::fprintf(stderr, "strata generate: expert arena borrowed from another process: %.2f GiB mapped, "
+                                 "nothing loaded\n",
+                         (double) strata::kernels::cpu::expert_layout().total / (1024.0 * 1024 * 1024));
+        else
+            std::fprintf(stderr, "strata generate: loaded %.2f GiB at %.2f GiB/s\n",
+                         (double) strata::kernels::cpu::expert_layout().total / (1024.0 * 1024 * 1024),
+                         arena_src.load_gib_per_second());
         // A rate under ~0.2 GiB/s is not the hardware.  Task Scheduler / service contexts throttle this
         // read+fill about 24x (measured 0.05 vs 1.42 GiB/s for the same binary, args and cache state; the
         // scheduler's defaults - Below normal priority and a least-privilege token - were the only
@@ -2792,6 +3098,12 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "strata generate: %d expert-pool workers%s%s\n", pool.workers(),
                  pool.host_works() ? " + the host thread" : "",
                  o.no_pool ? " (UNUSED: --no-pool)" : "");
+    // **WHICH CORES THIS PROCESS TOOK, AND WHY.**  The pool pins its workers and the host to physical cores, so
+    // on a machine running several Strata servers the assignment is a shared resource, not a private choice:
+    // two processes pinned onto the same six CPUs measured 2.5-3x slower each than two processes on disjoint
+    // cores.  The pool decided that under a machine-wide lease, and this repo's rule is that an adaptation the
+    // engine made has to be printed - a user comparing two servers needs to see the cores each one claims.
+    if (!pool.note().empty()) std::fprintf(stderr, "strata generate: %s\n", pool.note().c_str());
 
     // **THE MISALIGNMENT WARNING THAT STOOD HERE IS GONE, BECAUSE THE MISALIGNMENT IS FIXED.**
     //
@@ -3464,6 +3776,35 @@ int main(int argc, char** argv) {
             int32_t first_now = -1;        // where its buffers are laid out now
             int64_t lent_chunk = 0;
             std::vector<std::pair<int32_t, int32_t>> lent;
+            // S0.3 lever 1 (sticky loan): what the layout decisions cost.  `first_now` and `sp->chunk()`
+            // ARE the layout, and they survive a refill on purpose - giving the rows back to the cache does
+            // not un-carve the buffers - so the next lend that wants the same layout re-lays nothing.
+            int64_t relayouts = 0;         // Prefill::relayout calls actually run
+            int64_t relayout_skips = 0;    // lends that found the layout already right
+            int64_t loan_grows = 0;        // lends that widened the loan in place instead of refilling it
+            int64_t refilled = 0;          // rows streamed back into the cache, for the loan bill
+            // ---- S3.2b lever 5: the rows this cache lent and has NOT got back.  `lent` is the LIVE loan
+            // (the rows the prompt buffers are standing in right now); `led` is the ledger (rows that are
+            // non-resident because they are out, whether or not a loan is live).  They overlap while a loan
+            // is live and are disjoint the moment it is returned lazily.  `led` is what makes the loan a
+            // PROCESS resource instead of a per-request one: after a lazy return the layout, the ledger and
+            // the non-resident rows all survive into the next request, so that request's `lend()` marks
+            // almost nothing and refills nothing at all.
+            strata::program::prefill_loan::LoanLedger led;
+            /// S3.2b: is a batched prompt segment's loan standing in THIS cache right now?  Set by `lend()`
+            /// for every participant that can lend - whether or not it marked a single row, which under the
+            /// lazy rule it often does not, because the rows were already out from the previous request.
+            /// That distinction is load-bearing: the pump must never copy an expert into a slot the prompt
+            /// buffers are standing in, and "did I mark anything" is the wrong question to ask.
+            bool loan_live = false;
+            // The pump's own stream and completion event (S3.2b B).  One per cache, because a refill must
+            // land on the device that owns the layer, and because the confirmation is one event per cache:
+            // at most one batch in flight per cache at a time, so `loan_ev` can only ever confirm the copies
+            // that were queued since it was last recorded.  Created lazily - a box that never lends never
+            // allocates one, and R1's VRAM headroom is not for this.
+            cudaStream_t loan_stream = nullptr;
+            cudaEvent_t loan_ev = nullptr;
+            bool loan_pump_live = false;   ///< a batch is queued on `loan_stream`, not yet confirmed
         };
         auto part_slots = [&](const PfPart& p, int64_t c) -> int64_t {
             const uint64_t need = strata::prefill::Prefill::bytes_needed(g, *p.ses, c);
@@ -3488,9 +3829,13 @@ int main(int argc, char** argv) {
         // whose cache already filled its reserve, that is the over-subscription the auto sizing avoids - so the
         // chunk is the largest one EVERY participant can lend (a smaller chunk only reads slower)
         if (pf_borrow && d_res != nullptr) {
-            pf_parts.push_back({&xcache, &ss, &sp, -1, 0, multi_gpu ? split_at[0] : g.n_layers, -1, -1, 0, {}});
+            // Designated initializers, so the S3.2b members (`led`, `loan_live`, the pump's stream/event)
+            // keep their default member initialisers instead of being zero-filled by a short aggregate list.
+            pf_parts.push_back(PfPart{.cache = &xcache, .ses = &ss, .sp = &sp, .dev = -1, .lb = 0,
+                                      .le = multi_gpu ? split_at[0] : g.n_layers, .lent = {}, .led = {}});
             for (auto& st : stages)
-                pf_parts.push_back({&st->cache, &st->ss, &st->sp, st->dev, st->lb, st->le, -1, -1, 0, {}});
+                pf_parts.push_back(PfPart{.cache = &st->cache, .ses = &st->ss, .sp = &st->sp, .dev = st->dev,
+                                          .lb = st->lb, .le = st->le, .lent = {}, .led = {}});
             // The two tests plan_lend makes for CUDA0 alone, one participant at a time: a loan must leave the
             // 128-slot floor.  The percentage cap is an AUTO-chunk rule and only the auto scan applies it - an
             // explicit --prefill is the operator's number, and a loan of it only has to fit.  With one participant
@@ -3702,24 +4047,155 @@ int main(int argc, char** argv) {
         std::vector<ConvCheckpoint> checks;
         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
         bool cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
-        strata::core::ConversationCache conversations(
-            o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
-            (size_t) o.conversation_cache_slots);
+        // THE BUDGET IS A CAP, AND THE DEFAULT HAS TO FIT THE MACHINE IT RUNS ON.
+        //
+        // `--conversation-cache-slots 8` is the owner's ask: eight prefixes at a time. The RAM that takes is a
+        // different question, and it is the same trap the expert arena already documents (review finding C1,
+        // core/expert_source.hpp): a 47 GiB arena plus a 26.8 GB mapped PLE shard is most of a 64 GB machine,
+        // and host pages that the engine allocates are paid for by reclaiming the file cache underneath them.
+        // Parking 8 GiB of snapshots on a PC that has 3 GiB to spare does not fail - the admission check below
+        // allows it, because `MemAvailable` counts reclaimable cache - it quietly drops the pages the prompt
+        // path reads and the whole server gets slower than the feature it just gained.
+        //
+        // So the DEFAULT budget is what this machine can actually hand over right now: the cap, or the free RAM
+        // minus the parking floor and a headroom for the next request's own allocations, whichever is smaller.
+        // An explicit `--conversation-cache-mib` is never second-guessed - the user set it, the engine obeys it
+        // and says what it is.
+        size_t park_budget = o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0;
+        if (park_budget > 0 && !o.conversation_cache_mib_given) {
+            const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
+            const uint64_t headroom = 4ull << 30;   // the next request's own allocations, not the cache's
+            if (const auto avail = strata::core::conversation_available_memory()) {
+                const uint64_t room = *avail > floor + headroom ? *avail - floor - headroom : 0;
+                if (room < park_budget) {
+                    std::fprintf(stderr, "strata serve: parked-prefix budget %.1f GiB, not %.1f: only %.1f GiB of "
+                                         "RAM is free above the %.1f GiB parking floor and %.1f GiB of request "
+                                         "headroom (%d slots, pruned least recently used first; "
+                                         "--conversation-cache-mib N to override, 0 to park nothing)\n",
+                                 (double) room / (1024.0 * 1024.0 * 1024.0),
+                                 (double) park_budget / (1024.0 * 1024.0 * 1024.0),
+                                 (double) room / (1024.0 * 1024.0 * 1024.0),
+                                 (double) floor / (1024.0 * 1024.0 * 1024.0),
+                                 (double) headroom / (1024.0 * 1024.0 * 1024.0),
+                                 o.conversation_cache_slots);
+                    park_budget = (size_t) room;
+                }
+            }
+        }
+        strata::core::ConversationCache conversations(park_budget, (size_t) o.conversation_cache_slots);
+        // S3.1a: THE STAGE SET A PARKED CONVERSATION COVERS.  A `--layer-split` runs the model across
+        // several devices and each stage's `SessionState` owns only its layer carve, so a parked
+        // conversation is CUDA0's session (the `ss` argument) PLUS one part per later stage PLUS the
+        // MTP draft state, which is bound to the LAST stage's device.  Empty when there is no split,
+        // and then every snapshot call is exactly the single-GPU one it always was.
+        // Built once: the sessions do not move, and the vector must outlive every snapshot call.
+        std::vector<strata::core::ConversationStage> stage_list;
+        stage_list.reserve(stages.size());
+        for (auto& stp : stages) stage_list.push_back({&stp->ss, stp->dev});
+        strata::core::ConversationStageSet conv_stages;
+        conv_stages.stages = stage_list.empty() ? nullptr : stage_list.data();
+        conv_stages.count = (int64_t) stage_list.size();
+        // No split: -1 everywhere, so the snapshot core never asks CUDA to change device and the
+        // single-GPU path is exactly what it was.  With a split, CUDA0 owns the main session and
+        // the drafter reports the device it bound its own state to (the last stage's).
+        conv_stages.main_device = stage_list.empty() ? -1 : 0;
+        conv_stages.draft_device = stage_list.empty() ? -1 : mtp.device();
+        // STRATA_TRACE=1: one stderr line per step of a request (the log shows where a request stops).
+        // S3.1d: declared here rather than in the request body because the slot hand-over traces too.
+        const bool trace = std::getenv("STRATA_TRACE") != nullptr;
+        auto tr = [&](const char* what, long long a = -1, long long b = -1) {
+            if (!trace) return;
+            std::fprintf(stderr, "strata trace: %s %lld %lld\n", what, a, b);
+            std::fflush(stderr);
+        };
+        // S0.3 lever 4: PARKING REFUSAL BACKOFF.  `park_current` runs on every request that does not
+        // continue from the live session - which in a chat is nearly all of them, because they resume from
+        // a checkpoint at the turn boundary - and before it can answer "no room" it validates the whole
+        // view, walks every retained checkpoint, estimates the snapshot and reads the RAM telemetry.  On a
+        // box whose parked-prefix budget has already collapsed (the log shows 1.6 GiB, then 0.0 GiB) that
+        // answer is the same every time and is paid every time: 247 of them in this log, replayable with
+        // `bench/prefill/park_backoff_replay.py`.
+        //
+        // So after STRATA_PARK_REFUSALS consecutive physical-RAM-admission refusals (default 3, 0 = never
+        // back off), parking stops asking for STRATA_PARK_QUIET requests (default 64).  It is quiet, not
+        // off: the window expires by itself, and any successful park clears it, because that is proof the
+        // machine can take snapshots again.  A request that STARTS a conversation or MOUNTS a parked one is
+        // always allowed to park regardless of the window - those are the moments the cache is load-bearing,
+        // and they are the "new conversation, a switch" triggers parking has always had.  They do not clear
+        // the streak: on this box 1 request in 13 starts a new conversation, so clearing on them would make
+        // the backoff never engage at all.
+        const strata::program::prefill_loan::ParkBackoffPolicy park_policy = [] {
+            strata::program::prefill_loan::ParkBackoffPolicy p;
+            if (const char* v = std::getenv("STRATA_PARK_REFUSALS")) p.refusals = std::max<int64_t>(0, (int64_t) std::atoi(v));
+            if (const char* v = std::getenv("STRATA_PARK_QUIET")) p.quiet_requests = std::max<int64_t>(0, (int64_t) std::atoi(v));
+            return p;
+        }();
+        strata::program::prefill_loan::ParkBackoff park_backoff(park_policy);
+        int64_t request_index = 0;   // the backoff's window is counted in requests, not in seconds
+        // S3.1d: THE POSITION TABLE, UPLOADED.  `d_mrope` is ONE table for the process (risk R7), so
+        // handing the session to another slot means putting THAT slot's positions back in it.  Hoisted
+        // out of the request body because the hand-over needs it too; the request body's own
+        // `upload_mrope` is now a call to this, byte for byte the same copies.
+        auto upload_mrope_table = [&]() -> bool {
+            bool ok = cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t),
+                                 cudaMemcpyHostToDevice) == cudaSuccess;
+            for (auto& st : stages) {
+                const strata::core::OnDevice on(st->dev);
+                cudaDeviceSynchronize();
+                ok = ok && cudaMemcpy(st->mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t),
+                                      cudaMemcpyHostToDevice) == cudaSuccess;
+            }
+            return ok;
+        };
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
-        auto park_current = [&](size_t held) -> bool {
-            if (!conversations.enabled() || !live_ok || live.empty()) return true;
+        // S3.1d: the return type is `Saved`, not `bool`.  0.1.30 collapsed "parked", "refused" and
+        // "nothing to do" into true and only the snapshot failure into false, and for a request that is
+        // the right answer - it just re-reads.  A HAND-OVER cannot collapse them: a branch that was not
+        // parked is a branch whose cells are about to belong to somebody else, so it may never be
+        // mounted again.  `park_bytes` is what the last call stored (0 = nothing).
+        size_t park_bytes = 0;
+        // S3.7: WHAT A SNAPSHOT ACTUALLY COSTS ON THIS MODEL, learned from the parks that happened.
+        // Admission used to price every slot at `budget / --conversation-cache-slots` - a flat guess
+        // that charges a 150-token chat the same gigabyte it charges a 200k-token one, and then refuses
+        // the short one because that gigabyte was not free.  Parking has never worked that way:
+        // `conversation_snapshot_bytes` measures a branch against `live.size()`, the tokens it really
+        // holds, and `ConversationCache::bytes_` counts what was stored.  So the engine keeps the rate
+        // from the largest snapshot it has parked and prices each request at its own length.
+        // Engine-thread only: `park_current` writes it, the driver's admission and startup lines read
+        // it, and both run on the one thread that owns the session.
+        uint64_t park_per_token = 0;
+        uint64_t park_per_token_tokens = 0;   // the park that set the rate, for the log line
+        auto park_current = [&](size_t held, bool force = false,
+                                int64_t owner = strata::core::kNoOwner) -> strata::program::serve_swap::Saved {
+            park_bytes = 0;
+            if (!conversations.enabled() || !live_ok || live.empty()) return strata::program::serve_swap::Saved::skipped;
+            // Quiet, not off.  The estimate below is a whole-view validation, a walk of every retained
+            // checkpoint and a /proc read, and while a backoff is running its answer is already known.
+            // `force` is a request that starts a conversation or mounts a parked one: parking is exactly
+            // what saves that request's re-read, so it asks regardless of the window.
+            if (!force && park_backoff.quiet(request_index)) {
+                if (park_backoff.went_quiet()) {
+                    park_backoff.clear_went_quiet();
+                    std::fprintf(stderr, "strata serve: conversation cache: %lld consecutive RAM-admission refusals"
+                                         " - parking will not re-ask for %lld requests (STRATA_PARK_REFUSALS N to"
+                                         " change, 0 = always ask)\n",
+                                 (long long) park_backoff.consecutive(),
+                                 (long long) park_backoff.policy().quiet_requests);
+                }
+                return strata::program::serve_swap::Saved::skipped;
+            }
             const strata::core::ConversationView view{live, live_imgs, checks, cvec_cached};
             auto reuse = conversations.take_reuse();
             size_t estimate = 0;
-            if (!strata::core::conversation_snapshot_bytes(view, ss, g, mtp.kv_state(), estimate, err)) {
+            if (!strata::core::conversation_snapshot_bytes(view, ss, conv_stages, g, mtp.kv_state(), estimate, err)) {
                 std::fprintf(stderr, "strata serve: conversation cache: skip parking (%s)\n", err.c_str());
                 err.clear(); // A recoverable miss must not poison the batched draft prefill's error channel.
-                return true;
+                return strata::program::serve_swap::Saved::skipped;
             }
             const size_t fresh_estimate = estimate;
             if (!reuse.kv.empty() && !strata::core::conversation_snapshot_capture_bytes(
-                    reuse, view, ss, g, mtp.kv_state(), estimate, err)) {
+                    reuse, view, ss, conv_stages, g, mtp.kv_state(), estimate, err)) {
                 reuse = {};
                 estimate = fresh_estimate;
                 err.clear();
@@ -3732,9 +4208,10 @@ int main(int argc, char** argv) {
             if (!conversations.make_room(estimate, held)) {
                 std::fprintf(stderr, "strata serve: conversation cache: skip parking (snapshot %zu MiB exceeds available budget)\n",
                              estimate >> 20);
-                return true;
+                return strata::program::serve_swap::Saved::skipped;
             }
             const auto t0 = Clock::now();
+            bool parked_ok = false;   // the one answer that makes a later hand-over mountable again
             try {
                 const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
                 const size_t additional = estimate - reuse.bytes();
@@ -3742,18 +4219,39 @@ int main(int argc, char** argv) {
                         additional, floor)) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, or telemetry unavailable)\n",
                                  additional >> 20, (long long) o.conversation_cache_min_free_mib);
-                    return true;
+                    park_backoff.refused(request_index);   // S0.3 lever 4: the refusal this backoff exists for
+                    return strata::program::serve_swap::Saved::skipped;
                 }
                 strata::core::SavedConversation image;
                 size_t reused_bytes = 0;
-                if (!strata::core::conversation_snapshot_save(image, view, ss, g, mtp.kv_state(), err,
-                        std::move(reuse), &reused_bytes)) return false;
+                if (!strata::core::conversation_snapshot_save(image, view, ss, conv_stages, g, mtp.kv_state(), err,
+                        std::move(reuse), &reused_bytes)) return strata::program::serve_swap::Saved::failed;
                 if (!strata::core::conversation_memory_admit(strata::core::conversation_available_memory(), 0, floor)) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM floor after capture, or telemetry unavailable)\n");
-                    return true;
+                    park_backoff.refused(request_index);   // the same floor, checked again after the capture
+                    return strata::program::serve_swap::Saved::skipped;
                 }
                 const size_t snapshot_bytes = image.bytes();
-                const bool stored = conversations.put(std::move(image), held);
+                // S3.9: claim it.  `owner` is the slot whose branch this IS - the one the session
+                // reflects at the moment of the park.  Without the claim, the next request whose
+                // prompt happens to share a prefix can `take()` this whole entry and destroy a
+                // conversation that is still running.
+                const bool stored = conversations.put(std::move(image), owner, held);
+                parked_ok = stored;
+                if (stored) park_bytes = snapshot_bytes;   // 0 unless it really went into the cache
+                if (stored) park_backoff.parked();   // the machine can take snapshots: ask every time again
+                if (stored && !live.empty()) {
+                    // S3.7: learn the cost per context token from the BIGGEST snapshot parked so far.
+                    // The largest one is the right sample: a small park is dominated by the fixed
+                    // per-layer state (recurrence, indexer tails, the draft ring), so a rate learned
+                    // from an 81-token conversation would under-price a 100k one.
+                    const uint64_t rate = strata::program::serve_driver::bytes_per_token(
+                        snapshot_bytes, (uint64_t) live.size());
+                    if (rate > park_per_token) {
+                        park_per_token = rate;
+                        park_per_token_tokens = (uint64_t) live.size();
+                    }
+                }
                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
                              stored ? "parked" : "skipped", live.size(),
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
@@ -3763,8 +4261,100 @@ int main(int argc, char** argv) {
                 // prompt processing rather than killing a serving process.
                 std::fprintf(stderr, "strata serve: conversation cache: allocation failed; skip parking\n");
             }
-            return true;
+            return parked_ok ? strata::program::serve_swap::Saved::stored
+                             : strata::program::serve_swap::Saved::skipped;
         };
+
+        // ---- S3.1b/S3.1c: the slot registry and the wire formatter -------------------------------------
+        // Declared before the prompt path's callbacks because those capture them by reference.
+        //
+        // `slots` = --serve-slots.  0/1 keeps EVERYTHING below on 0.1.30's path: `sp_out` is untagged, no
+        // SLOT line is ever emitted, the parser never reads a request id, and `stop_req` is the only stop
+        // flag that moves.  >= 2 turns the stage-3 wire on: per-request lines carry `#<id>`, STOP can name a
+        // request, and each request runs through a registry row so /slots has something real to report.
+        // The scheduler that interleaves two conversations is S3.1e - until it lands, the request body still
+        // runs to completion, so what lands here is the WIRE and the bookkeeping, not the interleaving.
+        const int slots = o.serve_slots;
+        const bool tagged = slots >= 2;
+        strata::program::serve_proto::Out sp_out(tagged);
+        strata::program::slot::Registry slots_reg(slots, o.starve_ms);
+        std::mutex slot_mu;                       // guards slots_reg: the stdin thread cancels, the engine runs
+        std::atomic<int64_t> running_id{strata::program::serve_proto::kNoId};  // the request the body is running
+        // A `STOP <id>` for a request the engine has not read yet (it is still on the pipe, or in in_lines):
+        // the stdin thread cannot name a row that does not exist, so it parks the id here and the request loop
+        // picks it up when the row is created.  Bounded by the registry, oldest dropped first.
+        std::deque<int64_t> pending_cancel;
+        // This request's id (kNoId with --serve-slots 0/1, where the wire is 0.1.30's byte for byte).  Every
+        // per-request line goes through `sp_out`, so a tagged line and an untagged one are the same call with
+        // one flag and cannot drift.
+        int64_t req_id = strata::program::serve_proto::kNoId;
+        // The request-body ERR sites inside the snapshot / lend / refill code belong to the other stage-3
+        // task (S3.1d/e own those call sites); the ones routed here are the request loop's own.  The list is
+        // in .megamind/src/program/slot-notes.md so none is missed.
+        auto sp_err = [&](const std::string& msg) -> std::string { return sp_out.err(msg, req_id); };
+        // The SLOT transition line (§6.2), emitted only on the stage-3 wire.  Takes the registry lock, so the
+        // caller must not already hold it.
+        auto emit_slot = [&](int64_t id) {
+            if (!tagged) return;
+            std::string out;
+            {
+                std::lock_guard<std::mutex> lk(slot_mu);
+                const strata::program::slot::Slot* s = slots_reg.find(id);
+                if (s == nullptr) return;
+                out = sp_out.slot(s->id, s->state_name(), s->ctx_used, s->ctx_cap,
+                                  s->prompt_tokens, s->generated, s->parked_bytes);
+            }
+            std::printf("%s\n", out.c_str());
+            std::fflush(stdout);
+        };
+        // Move a slot along the state machine and say so on the wire.  A refused edge goes to stderr, never to
+        // the client: it is a bookkeeping bug, not the request's error, and the request must still get its DONE.
+        auto slot_step = [&](int64_t id, strata::program::slot::State to) {
+            if (!tagged) return;
+            std::string serr;
+            {
+                std::lock_guard<std::mutex> lk(slot_mu);
+                if (!slots_reg.transition(id, to, serr))
+                    std::fprintf(stderr, "strata serve: slot %lld -> %s: %s\n", (long long) id,
+                                 strata::program::slot::state_name(to), serr.c_str());
+            }
+            emit_slot(id);
+        };
+        // A request is over: its row goes to `idle` (one last SLOT line, so /slots can show a finished
+        // conversation), then the row is freed and the session is no longer claimed.
+        auto slot_finish = [&](int64_t id) {
+            if (!tagged) return;
+            {
+                std::lock_guard<std::mutex> lk(slot_mu);
+                std::string serr;
+                slots_reg.transition(id, strata::program::slot::State::idle, serr);
+                slots_reg.set_active(strata::program::serve_proto::kNoId);
+                running_id.store(strata::program::serve_proto::kNoId);
+            }
+            emit_slot(id);
+            std::lock_guard<std::mutex> lk(slot_mu);
+            slots_reg.release(id);
+        };
+        // The running slot's cancel flag is `stopped()` below - it has to be declared after `stop_req`, which
+        // the stdin thread owns.
+
+        // ---- S3.1e-2: the per-slot watchdog state (risk R3) --------------------------------------
+        // 0.1.30's watchdog aborts the process when the ONE request stops beating.  With N slots that
+        // would kill N-1 healthy conversations because one stalled request owns the GPU, so the driver
+        // publishes one entry per ACTIVE slot here and the watchdog thread decides between the two
+        // cases: every active slot stalled = the engine itself is wedged (abort, as today, and name
+        // the slots); only some of them stalled = the engine thread is alive and simply not serving
+        // those slots, so they get `ERR <id>` and their slot is destroyed instead.  The engine thread
+        // owns every write; the watchdog thread only reads and appends to `watch_kill`, which the
+        // engine thread drains between steps (it cannot print to stdout itself - the engine thread
+        // owns the wire, §3.1).
+        // Static storage on purpose: the watchdog thread is detached, and a capture of a local would
+        // dangle the moment the serve block returns.  There is exactly one serve block per process.
+        static std::mutex watch_mu;
+        static std::vector<strata::program::serve_driver::SlotWatch> watch;
+        static std::deque<int64_t> watch_kill;  // slots the watchdog gave up on; the driver ERRs them
+        static int watchdog_limit_s = 60;       // STRATA_WATCHDOG_S; set below, read by the driver too
+
         int64_t pp_total = 0, pp_from = 0, pp_next_check = 0;
         Clock::time_point pp_t0 = Clock::now();
         auto imgs_below = [&](const std::vector<ImgKey>& all, int64_t L) {
@@ -3830,8 +4420,9 @@ int main(int argc, char** argv) {
             // progress for the server window: PP <position reached> <prompt tokens> <ms> <fresh tokens/s>
             const int64_t done = p0 + T;
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
-            std::printf("PP %lld %lld %.0f %.1f\n", (long long) done, (long long) pp_total, ms,
-                        ms > 0.0 ? 1000.0 * (double) (done - pp_from) / ms : 0.0);
+            std::printf("%s\n", sp_out.pp(done, pp_total, ms,
+                                        ms > 0.0 ? 1000.0 * (double) (done - pp_from) / ms : 0.0,
+                                        req_id).c_str());
             strata::core::progress_at("reading the prompt (batched), done up to token", done);
             strata::core::progress_beat();
             std::fflush(stdout);
@@ -3889,13 +4480,70 @@ int main(int argc, char** argv) {
         cudaEvent_t adapt_ev = nullptr;
         cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
         // a layer split's later stages keep a copy of the residency table on their devices, and swap on their own
+        //
+        // S0.3 lever 2: THE RESIDENCY UPLOAD IS A DECODE-WINDOW COST, NOT A PROMPT COST.
+        //
+        // The table is `n_layers * n_expert` int32 (24 576 entries = 96 KiB), and today `res_upload()`
+        // copies it WHOLE, synchronously, to EVERY device on every lend and every refill: on this box's
+        // 3-way split that is 3 blocking copies per call, 6 per request, 9 when the prompt splits at a turn
+        // boundary - on links measured at 2.9 / 1.3 / 24.5 GB/s, shared with two other serving processes.
+        //
+        // Two source facts make most of those copies unnecessary:
+        //
+        //   * the batched prompt path never reads the DEVICE table.  `Prefill` holds the host pointer
+        //     (`init`'s `host_res`) and decides residency with `m.host_res[l * n_expert + e] >= 0`
+        //     (prefill.cpp:1097, 1586, 1598, 1697, 1729); the CPU pool's adapter reads `drive.d.host_res`.
+        //     The device copy is read by `Verifier::resident_plan` and by the captured token graph - both
+        //     DECODE paths.  So a lend does not need an upload: the next thing that reads the device table
+        //     is a verify window, and `refill()` always runs before a window reads (the segment loop calls
+        //     it at the window boundary and once the prompt is read).
+        //   * a request's lend/refill round trip restores the table exactly: `lend` sets
+        //     `host_res[i] = kNotResident` for the rows it lends and `refill_one` sets
+        //     `host_res[i] = slot` for the same pairs.  So after the refill the host table is byte-identical
+        //     to what the devices already hold, and the end-of-request upload moves nothing.
+        //
+        // `ResidencyUpload` decides by COMPARING the host table with the last content the devices were
+        // given, so it is right even if a writer never announced its change - that is what makes skipping
+        // safe rather than hopeful, and it is why the adaptive tier's `apply_pending` path (which does
+        // change the table for real, between decode rounds) still uploads.
+        //
+        // STRATA_RES_UPLOAD_ALWAYS=1 restores today's behaviour: upload at lend, and unconditionally.
+        strata::program::prefill_loan::ResidencyUpload res_dirty((int64_t) g.n_layers);
+        if (d_res != nullptr) res_dirty.synced(host_res);   // startup put this exact table on every device
         auto res_upload = [&]() {
-            if (d_res != nullptr)
-                cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+            if (d_res == nullptr) return;
+            if (!res_upload_always() && !res_dirty.due(host_res)) {
+                res_dirty.note_skipped();
+                return;
+            }
+            cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
             for (auto& st : stages) {
                 const strata::core::OnDevice on(st->dev);
                 cudaMemcpy(st->d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
             }
+            res_dirty.uploaded(host_res);
+        };
+
+        // S0.3: the loan's counters, summed over the participants (relayouts run, relayouts skipped,
+        // loans grown in place, rows refilled).  Cumulative over the process; a request's own bill is the
+        // delta from where it started.  S3.2b adds two cumulative ones: rows the prompt path took out, and
+        // rows the pump walked home between decode steps.
+        auto loan_totals = [](const std::vector<PfPart>& v) {
+            std::array<int64_t, 6> t{0, 0, 0, 0, 0, 0};
+            for (const PfPart& p : v) {
+                t[0] += p.relayouts; t[1] += p.relayout_skips;
+                t[2] += p.loan_grows; t[3] += p.refilled;
+                t[4] += p.led.taken(); t[5] += p.led.returned_pumped();
+            }
+            return t;
+        };
+        // NOT cumulative: how many rows are out of the caches RIGHT NOW.  Under the lazy rule this is the
+        // number that proves the refill was deferred rather than performed - and it is the number that says
+        // how much CPU-side decode the next request inherits.
+        auto loan_outstanding = [](const std::vector<PfPart>& v) {
+            int64_t n = 0;
+            for (const PfPart& p : v) n += (int64_t) (p.led.owed() + p.led.inflight());
+            return n;
         };
         auto apply_pending = [&](bool wait) {
             if (pending.empty()) return;
@@ -3908,11 +4556,359 @@ int main(int argc, char** argv) {
                 }
             for (auto& st : stages) st->adapt_live = false;
             src.commit_exchanges();   // the resident RAM mode: the evicted experts take their places in RAM
-            for (const auto& [i, slot] : pending) host_res[(size_t) i] = slot;
+            for (const auto& [i, slot] : pending) {
+                host_res[(size_t) i] = slot;
+                // S3.2b: the adaptive tier just put this row home, in a slot it chose for itself.  If the
+                // prompt loan's ledger still owned it, the pump would ALSO copy it into its original slot -
+                // two owners for one expert, and the slot the adaptive tier paid a victim for would be
+                // orphaned.  `adapt()` already refuses to pick a ledger row as a candidate (see the note
+                // there), so this is the belt to that braces: it can only fire for a row that became owed
+                // after the swap was queued.
+                for (PfPart& p : pf_parts)
+                    if (i >= p.lb * g.n_expert && i < p.le * g.n_expert) p.led.drop(i);
+            }
             pending.clear();
             res_upload();
         };
+
+        // the batched path's slots are lent just before its first run and given back before a window
+        // reads - so the windows always see a cache whose RESIDENCY TABLE is true.  They do not have to see
+        // a whole cache: that was S0.3's assumption, and S3.2b's lever 5 is what breaks it.
+        //
+        // ---- S3.2b: TWO WAYS TO GIVE THE LOAN BACK, and the difference between them is 4.95 GiB. -------
+        //
+        // EAGER (0.1.30, and the default on the serial path): `refill_one` streams every row it lent back
+        // from the arena into the same slot and marks it resident again.  On this box that is 2 625 + 1 971
+        // + 1 885 = 6 481 rows, 4.95 GiB per stage, over links measured at 2.9 / 1.3 / 24.5 GB/s - CUDA1's
+        // share alone is ~3.8 s - and `--serve` prints `prompt_ms` after it, so all of it is inside the
+        // fitted 9.5 s fixed term.
+        //
+        // LAZY (the default under the concurrent driver): nothing is copied.  The rows stay marked
+        // non-resident and go into the cache's LEDGER (`PfPart::led`), and the layout (`first_now`,
+        // `sp->chunk()`) stays standing.  Decode runs the rows that are out on the CPU pool, which is what
+        // it does for every expert the cache has never held; then the pump walks the ledger home in bounded
+        // batches between decode steps.  The NEXT request's `lend()` finds its range already non-resident,
+        // marks almost nothing, re-lays nothing, and its `finish_prefill` returns nothing - which is where
+        // the fixed cost actually dies, rather than merely being hidden.
+        //
+        // THE INVARIANT BOTH OBEY, and it is the only thing between this and plausible garbage:
+        //     (I1) `host_res[i] >= 0` <=> slot `host_res[i]` on the owning device holds expert i's bytes NOW.
+        // A row is marked non-resident BEFORE its slot is handed to the prompt path, and marked resident
+        // only AFTER its copy has been confirmed landed (`settle_pump`, one event per cache, at most one
+        // batch in flight per cache).  There is no window in which the table claims a slot holds an expert
+        // while it holds scratch.  (I2) every device's `d_res` equals `host_res` at the start of every
+        // window: `reconcile_residency()` at the top of `run_decode_step`, and `res_upload()` inside every
+        // return path.
+        //
+        // A stage refills through its own cache and its own device, and marks only its own layers' rows - a
+        // slot refilled into the wrong cache would leave that stage's cache holding an expert it does not
+        // own, which is silent and produces plausible tokens.
+        namespace pfl = strata::program::prefill_loan;
+        const pfl::LazyRefillPolicy loan_policy = [&] {
+            pfl::LazyRefillPolicy p;
+            p.rows_per_step = loan_pump_rows();
+            const int env = lazy_loan_env();
+            // `auto`: only under the concurrent driver.  Those are exactly the three conditions S3.1e-2
+            // gates its own loop on, and they are all knowable here (the loop's `driver_on` is computed
+            // later, from the same three).
+            const bool concurrent_possible = slots_reg.concurrent() &&
+                                             !strata::program::serve_swap::swaps_disabled_by_env() &&
+                                             conversations.enabled();
+            p.lazy = env >= 0 ? (env == 1) : concurrent_possible;
+            return p;
+        }();
+        // Report the mode in force.  Only on the concurrent driver, under the instrument, or when the owner
+        // forced the mode: the serial path's stderr stays exactly what 0.1.30 printed otherwise.
+        if (loan_timing() || slots_reg.concurrent() || lazy_loan_env() >= 0)
+            std::fprintf(stderr, "strata serve: prompt loan return: %s (%lld row(s) per cache in flight on "
+                                 "the pump; STRATA_PREFILL_LAZY_LOAN=0 refills the whole loan at the end of "
+                                 "every prompt, =1 forces it on)%s\n",
+                         loan_policy.lazy ? "LAZY (the rows stay out and walk home between decode steps)"
+                                          : "EAGER (streamed back before any window reads)",
+                         (long long) loan_policy.rows_per_step,
+                         slots_reg.concurrent() ? "" : " - the serial path keeps 0.1.30's behaviour");
+        // Confirm the pump batch this cache has in flight, and only then may its rows be resident.  `wait`
+        // = block until it lands (an eager refill, or a `lend()` about to overwrite the same slots); false
+        // = take it if it already has.  Marking happens here and nowhere else, which is what makes (I1) a
+        // property of one function rather than of every caller's discipline.
+        auto settle_pump = [&](PfPart& p, bool wait, std::string& e) -> bool {
+            if (!p.loan_pump_live) return true;
+            {
+                const strata::core::OnDevice on(p.dev);
+                const cudaError_t q = wait ? cudaEventSynchronize(p.loan_ev) : cudaEventQuery(p.loan_ev);
+                if (q == cudaErrorNotReady) return true;      // still in flight: nothing is resident yet
+                if (q != cudaSuccess) {
+                    e = std::string("confirming a prompt-loan refill copy failed: ") + cudaGetErrorString(q);
+                    cudaGetLastError();
+                    return false;
+                }
+            }
+            p.loan_pump_live = false;
+            // The copies landed.  NOW the rows may be marked resident - in the same order they were queued.
+            // This is the only place a lazily-returned row becomes resident again, which is what makes (I1)
+            // a property of one function rather than of every caller's discipline.
+            //
+            // The `host_res < 0` test is not decoration.  If the adaptive tier made this row resident in
+            // some OTHER slot while this batch was in flight, `apply_pending()` already dropped it from the
+            // ledger and `landed()` will not return it; if anything else did, marking it back into the
+            // loan's original slot would orphan the newer one.  So: mark only a row that is still out.
+            for (const pfl::LoanRow& r : p.led.landed())
+                if (host_res[(size_t) r.index] < 0) host_res[(size_t) r.index] = r.slot;
+            return true;
+        };
+        // Give ONE participant's loan back without copying anything: the rows stay non-resident, the ledger
+        // owns them, the layout stays.  The device table must follow the host table, so the caller uploads
+        // once afterwards - 96 KiB instead of 4.95 GiB.
+        auto return_loan_lazy = [&](PfPart& p) {
+            p.loan_live = false;
+            if (p.lent.empty()) return;
+            p.lent.clear();
+            // `lent_chunk` and `first_now` deliberately survive: the buffers are still carved in that slot
+            // range, so the next lend that wants the same layout re-lays nothing and re-marks nothing.
+        };
+        // Put the devices' copy of the table back in step with the host's.  `res_upload()` decides by
+        // CONTENT, so when nothing moved this is a 96 KiB compare and no copy.
+        //
+        // It runs at the top of every window path ONLY in lazy mode, and that is not a performance
+        // concession - it is the mode's own requirement.  In lazy mode `settle_pump()` marks rows resident
+        // between windows with no lend or refill in between, so the table really can be stale at a window
+        // boundary and something must close that gap.  In eager mode nothing marks anything resident except
+        // `refill_one()` and `apply_pending()`, and both upload themselves, so the extra call would be a
+        // per-window compare for a state that cannot occur - and it would inflate the
+        // `res upload N (M skipped)` bill that `bench/prefill/analyze.py --compare` reads against the S0.3
+        // baseline.  The serial path's counters therefore stay comparable with the baseline log.
+        auto reconcile_residency = [&]() {
+            if (!loan_policy.lazy) return;
+            res_upload();
+        };
+        // Stream ONE participant's LIVE loan home and mark it resident.  Eager mode this is the whole
+        // end-of-request refill (0.1.30).  Lazy mode it is only reachable from `lend()` handing a loan back
+        // mid-request because the operator set `STRATA_PREFILL_STICKY_LOAN=0`, and it deliberately returns
+        // the rows of THIS loan and not every row earlier requests left out: turning stickiness off must
+        // cost what it costs in 0.1.30, and must not quietly become a full-ledger drain.
+        //
+        // The full "make the cache whole NOW" primitive is `drain_loans_idle()`, not this: under the lazy
+        // rule nothing in the request path needs the cache whole, because a row that is out is marked
+        // non-resident and decode runs it on the CPU pool.
+        // Stream ONE participant's LIVE loan home and mark it resident.
+        //
+        // Eager mode this is the end-of-request refill, exactly 0.1.30's.  Lazy mode it is only reachable
+        // from `lend()` handing a loan back MID-REQUEST because the operator set
+        // `STRATA_PREFILL_STICKY_LOAN=0`, and it deliberately returns the rows of THIS loan and not every
+        // row earlier requests left out: turning stickiness off must cost what it costs in 0.1.30, and
+        // must not quietly become a full-ledger drain.
+        //
+        // There is deliberately no "drain the whole ledger now" caller in the request path.  Under the lazy
+        // rule nothing in it needs the cache whole - a row that is out is marked non-resident and decode
+        // runs it on the CPU pool - and the one place that does want the cache whole is the engine being
+        // idle, which is `drain_loans_idle()`.
+        auto refill_one = [&](PfPart& p, std::string& e) -> bool {
+            if (!settle_pump(p, true, e)) return false;   // no batch may be in flight while we copy
+            std::vector<pfl::LoanRow> rows;
+            rows.reserve(p.lent.size());
+            for (const auto& [i, slot] : p.lent) rows.push_back(pfl::LoanRow{i, slot});
+            if (rows.empty()) { p.lent.clear(); p.lent_chunk = 0; p.loan_live = false; return true; }
+            tr("refill start", (long long) rows.size());
+            const auto tref = Clock::now();
+            const strata::core::OnDevice on(p.dev);
+            for (const pfl::LoanRow& r : rows) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
+                const uint8_t* b = srcp->blob(r.index / g.n_expert, r.index % g.n_expert);
+                const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(r.index / g.n_expert);
+                if (b == nullptr || !(refill_blocking() ? p.cache->fill_slot_blocking(r.slot, b, e, nb)
+                                                        : p.cache->fill_slot_queued(r.slot, b, e, nb))) {
+                    p.led.requeue_inflight();
+                    return false;
+                }
+                // (I1): the copy is queued on the legacy stream and `sync_queued()` below confirms the
+                // whole batch before any window can read, so marking here is marking after the bytes are
+                // in the slot.
+                host_res[(size_t) r.index] = r.slot;
+            }
+            if (!p.cache->sync_queued(e)) { p.led.requeue_inflight(); return false; }
+            p.refilled += (int64_t) rows.size();
+            // The rows are home, so the ledger must stop owning them - otherwise the pump would copy the
+            // same experts into the same slots a second time.  `refilled()`, never a whole-ledger clear:
+            // the rows this call did NOT copy are still out, and still owed.
+            for (const pfl::LoanRow& r : rows) p.led.refilled(r.index);
+            if (loan_timing()) {
+                int64_t bytes = 0;
+                for (const pfl::LoanRow& r : rows)
+                    bytes += (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(r.index / g.n_expert);
+                std::fprintf(stderr, "strata serve: loan refill EAGER CUDA%d: %zu rows (%.2f GiB) in %.1f ms "
+                                     "(%zu still out of the cache)\n",
+                             p.dev, rows.size(), (double) bytes / 1073741824.0,
+                             std::chrono::duration<double, std::milli>(Clock::now() - tref).count(),
+                             p.led.owed() + p.led.inflight());
+            }
+            p.lent.clear();
+            p.lent_chunk = 0;   // the rows are the cache's again; the LAYOUT (first_now, sp->chunk()) is not
+            p.loan_live = false;
+            return true;
+        };
+        auto refill = [&](std::string& e) -> bool {
+            if (loan_policy.lazy) {
+                // The lazy return.  Nothing is copied here; the ledger and the pump own the rows from now
+                // on, and the table goes out so no window can read a slot the prompt path was standing in.
+                // Every participant's `loan_live` clears, including one that marked no rows at all - its
+                // buffers were still carved in that range, and the pump must not aim at it until this is off.
+                bool any = false;
+                for (PfPart& p : pf_parts) {
+                    if (p.lent.empty() && !p.loan_live) continue;
+                    any = true;
+                    return_loan_lazy(p);
+                }
+                if (any) res_upload();
+                return true;
+            }
+            bool any = false;
+            for (PfPart& p : pf_parts)
+                if (!p.lent.empty()) { any = true; if (!refill_one(p, e)) return false; }
+            // Eager mode: whatever the state, no segment is reading these buffers any more, so the pump
+            // (which never runs in this mode) would be allowed to aim at them.  Clear the flag so a mode
+            // switch mid-process - or a reader of the report - cannot be misled by a stale one.
+            for (PfPart& p : pf_parts) p.loan_live = false;
+            if (any) res_upload();
+            return true;
+        };
+        // ---- THE PUMP (lever 5's B): walk the ledgers home in bounded batches, between decode steps. ----
+        // One batch per cache at a time, on that cache's own non-blocking stream, so the DMA never sits in
+        // front of the next window on the session stream, and so one event per cache can confirm exactly
+        // the copies queued since it was last recorded.  A cache with a LIVE loan is skipped entirely: its
+        // prompt buffers ARE those slots, and a copy landing inside a live range is scratch by the time the
+        // segment finishes - and the table would have said otherwise in between.
+        auto pump_loans = [&](std::string& e) -> bool {
+            if (!loan_policy.lazy) return true;
+            for (PfPart& p : pf_parts) {
+                if (!settle_pump(p, false, e)) return false;
+                if (!pfl::pump_may_run(loan_policy, p.led, p.loan_live)) continue;
+                const size_t n = pfl::pump_batch(loan_policy, p.led);
+                if (n == 0) continue;
+                if (p.loan_stream == nullptr) {
+                    const strata::core::OnDevice on(p.dev);
+                    cudaStream_t s = nullptr;
+                    cudaEvent_t ev = nullptr;
+                    if (cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) != cudaSuccess ||
+                        cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
+                        if (s != nullptr) cudaStreamDestroy(s);
+                        e = "cannot create the prompt-loan pump stream";
+                        return false;
+                    }
+                    p.loan_stream = s;
+                    p.loan_ev = ev;
+                }
+                const std::vector<pfl::LoanRow> rows0 = p.led.pump(n, &drive.d.usage);
+                // Belt against the one way a ledger row could already be home: the adaptive tier promoted it
+                // into some OTHER row's vacated slot (`adapt()` refuses that via `owns()`, and
+                // `apply_pending()` drops it, but a row can only be pumped if it was owed when the batch was
+                // taken).  Copying it into its original slot anyway would be harmless-but-wasted; marking it
+                // resident twice is not, so the row is dropped from the ledger instead.
+                //
+                // The reverse hazard - `ExpertCache::admit()` handing a LEDGER SLOT to a different expert -
+                // cannot happen, and that is worth stating because it is the one thing this design depends
+                // on: the cache never evicts and never re-hands-out a slot, so `next_free_` (and per-layer
+                // `layer_next_`) is always strictly past every slot ever handed out, and a ledger slot was
+                // handed out.  A new admission therefore gets a slot no residency entry has ever pointed at.
+                std::vector<pfl::LoanRow> rows;
+                rows.reserve(rows0.size());
+                for (const pfl::LoanRow& r : rows0) {
+                    if (host_res[(size_t) r.index] >= 0) { p.led.drop(r.index); continue; }
+                    rows.push_back(r);
+                }
+                if (rows.empty()) continue;
+                const auto tpump = Clock::now();
+                int64_t bytes = 0;
+                {
+                    const strata::core::OnDevice on(p.dev);
+                    for (const pfl::LoanRow& r : rows) {
+                        const uint8_t* b = srcp->blob(r.index / g.n_expert, r.index % g.n_expert);
+                        const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(r.index / g.n_expert);
+                        if (b == nullptr || !p.cache->fill_slot(r.slot, b, p.loan_stream, e, nb)) {
+                            p.led.requeue_inflight();   // not resident, not home: try again later
+                            return false;
+                        }
+                        bytes += nb;
+                    }
+                    if (cudaEventRecord(p.loan_ev, p.loan_stream) != cudaSuccess) {
+                        p.led.requeue_inflight();
+                        e = "cannot record the prompt-loan pump event";
+                        return false;
+                    }
+                }
+                p.loan_pump_live = true;
+                if (loan_timing())
+                    std::fprintf(stderr, "strata serve: loan pump CUDA%d: %zu rows (%.2f GiB) queued in %.1f ms "
+                                         "(%zu still out of the cache)\n",
+                                 p.dev, rows.size(), (double) bytes / 1073741824.0,
+                                 std::chrono::duration<double, std::milli>(Clock::now() - tpump).count(),
+                                 p.led.owed() + p.led.inflight());
+            }
+            return true;
+        };
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
+        // ---- S3.2b: the IDLE drain.  The pump between decode steps is bounded so it can never crowd a
+        // window; that leaves a question the report has to be able to answer - when does a cache that has
+        // been running for a while get WHOLE again?  Here: while the engine has nothing to run.  The GPU is
+        // free then, the copies are the only work on the device, and the next request's decode starts from a
+        // warmer cache.  Bounded by wall time rather than rows, because the driver thread is the one that
+        // reads the next request line: a long drain must not delay an arriving request by more than this.
+        //
+        // It is NOT required for correctness.  A ledger that never drains is still correct - every row in it
+        // is marked non-resident, decode runs it on the CPU pool, and the next `lend()` finds it already out,
+        // which is the free case.  This is purely the hit-rate recovery, paid at the cheapest possible moment.
+        auto drain_loans_idle = [&](int64_t budget_ms, auto&& line_waiting) {
+            if (!loan_policy.lazy) return;
+            const auto t0 = Clock::now();
+            std::string derr;
+            bool bad = false;
+            for (;;) {
+                const int64_t before = loan_outstanding(pf_parts);
+                if (!pump_loans(derr)) { err = derr; err.clear(); bad = true; break; }
+                bool any_live = false;
+                for (const PfPart& p : pf_parts) if (p.loan_pump_live) any_live = true;
+                if (any_live) {
+                    // Wait for the batch this round queued, so the next round may queue another.  One batch
+                    // per cache at a time is the invariant `settle_pump`'s single event relies on.
+                    for (PfPart& p : pf_parts)
+                        if (p.loan_pump_live) {
+                            if (!settle_pump(p, true, derr)) { err = derr; err.clear(); bad = true; break; }
+                            break;
+                        }
+                    if (bad) break;
+                } else if (loan_outstanding(pf_parts) == before) {
+                    // Nothing in flight and nothing new queued: either the caches are whole, or a cache's
+                    // loan is still physically live and the pump is (correctly) refused.  Either way this
+                    // loop cannot make further progress, and spinning here would burn 250 ms of a thread
+                    // that is supposed to be waiting for the next request line.
+                    break;
+                }
+                if (std::chrono::duration<double, std::milli>(Clock::now() - t0).count() >= budget_ms) break;
+                // A request line that arrived mid-drain wins: this is the same thread that has to notice
+                // it, and a bounded cache warming is not worth that much first-token latency.
+                if (line_waiting()) break;
+            }
+            (void) bad;
+            // (I2) again, locally: `pump_loans`/`settle_pump` may have marked rows resident, so the devices
+            // get the table before this returns rather than at some later caller's window boundary.
+            // `res_upload()` compares content, so when nothing moved this is a 96 KiB compare.
+            res_upload();
+            if (loan_timing()) {
+                const int64_t out = loan_outstanding(pf_parts);
+                if (out == 0)
+                    std::fprintf(stderr, "strata serve: loan drain idle: the caches are whole again (%.0f ms)\n",
+                                 std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+            }
+        };
+        // S3.2b: is this residency index one of the prompt loan's OUT rows?  `adapt()` must not promote one:
+        // it would take some other row's slot as a victim, and the pump would then ALSO copy the same expert
+        // into the slot it already owns, orphaning the one the adaptive tier paid for.  The pump is the
+        // better choice anyway - its slot is already the row's own, so it needs no victim at all.
+        auto loan_owns_row = [&](int64_t index) -> bool {
+            if (!loan_policy.lazy) return false;   // eager mode never populates a ledger
+            for (const PfPart& p : pf_parts)
+                if (index >= p.lb * g.n_expert && index < p.le * g.n_expert && p.led.owns((int32_t) index))
+                    return true;
+            return false;
+        };
         auto adapt = [&]() -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
             struct Swap { float gain; int32_t layer, in, out; };
@@ -3924,7 +4920,9 @@ int main(int argc, char** argv) {
                 const float* u = drive.d.usage.data() + l * g.n_expert;
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                    if (r[e] < 0) { if (u[e] >= 2.0f) cand.emplace_back(u[e], e); }
+                    if (r[e] < 0) {
+                        if (u[e] >= 2.0f && !loan_owns_row(l * g.n_expert + e)) cand.emplace_back(u[e], e);
+                    }
                     else vict.emplace_back(u[e], e);
                 }
                 if (cand.empty() || vict.empty()) continue;
@@ -4006,7 +5004,47 @@ int main(int argc, char** argv) {
             };
             while (getline_fd(l)) {
                 if (!l.empty() && l.back() == '\r') l.pop_back();
-                if (l == "STOP") { stop_req.store(true); continue; }
+                // S3.1c: STOP, or (with --serve-slots >= 2) STOP <id>.  A bare STOP is 0.1.30's: it stops
+                // whatever is running.  STOP <id> stops THAT request - and while the engine still runs one
+                // request to completion (S3.1e owns the interleaving), the only request that can be running
+                // is the one whose id is in `running_id`, so the legacy `stop_req` is set exactly when the
+                // named request is the running one and left alone when it is not.  That is the whole point
+                // of naming a request: `STOP 2` while request 1 runs must not cancel request 1.
+                if (l == "STOP" || (tagged && l.rfind("STOP ", 0) == 0)) {
+                    const bool has_id = l.size() > 5;
+                    if (!has_id) {
+                        std::lock_guard<std::mutex> lk(in_mu);
+                        stop_req.store(true);
+                        {
+                            std::lock_guard<std::mutex> slk(slot_mu);
+                            const int64_t who = slots_reg.newest_id();
+                            if (who != strata::program::serve_proto::kNoId) slots_reg.cancel_request(who);
+                        }
+                        continue;
+                    }
+                    long long v = 0;
+                    bool numeric = true;
+                    for (size_t i = 5; i < l.size(); ++i)
+                        if (l[i] < '0' || l[i] > '9') { numeric = false; break; }
+                    if (numeric) v = std::atoll(l.c_str() + 5);
+                    if (!numeric) {   // a malformed STOP <id>: 0.1.30 had no such line, so it is a bad request
+                        std::lock_guard<std::mutex> lk(in_mu);
+                        in_lines.push_back(l);
+                        in_cv.notify_one();
+                        continue;
+                    }
+                    {
+                        std::lock_guard<std::mutex> slk(slot_mu);
+                        if (!slots_reg.cancel_request(v) && running_id.load() != v) {
+                            // The request has not been admitted yet (its line is still on the pipe).  Remember
+                            // the cancel so the request loop applies it the moment the row exists - otherwise a
+                            // client that cancels a queued request would have it run anyway.
+                            if (pending_cancel.size() < 64) pending_cancel.push_back(v);
+                        }
+                    }
+                    if (running_id.load() == v) stop_req.store(true);
+                    continue;
+                }
                 std::lock_guard<std::mutex> lk(in_mu);
                 in_lines.push_back(l);
                 in_cv.notify_one();
@@ -4023,14 +5061,19 @@ int main(int argc, char** argv) {
             in_lines.pop_front();
             return true;
         };
-        sp.should_stop = [&] { return stop_req.load(); };
-        // STRATA_TRACE=1: one stderr line per step of a request (the log shows where a request stops)
-        const bool trace = std::getenv("STRATA_TRACE") != nullptr;
-        auto tr = [&](const char* what, long long a = -1, long long b = -1) {
-            if (!trace) return;
-            std::fprintf(stderr, "strata trace: %s %lld %lld\n", what, a, b);
-            std::fflush(stderr);
+        sp.should_stop = [&] {
+            if (!tagged) return stop_req.load();
+            if (stop_req.load()) return true;
+            std::lock_guard<std::mutex> lk(slot_mu);
+            const strata::program::slot::Slot* s = slots_reg.find(req_id);
+            return s != nullptr && s->cancel.load();
         };
+        // The same question for the request body's own checkpoints (between verify windows, between prompt
+        // segments).  With --serve-slots 0/1 this is `stop_req`, exactly today; with >= 2 a `STOP <id>` that
+        // named a DIFFERENT request does not stop this one, which is the whole point of naming it.
+        auto stopped = [&]() -> bool { return sp.should_stop(); };
+        // STRATA_TRACE: `trace`/`tr` are declared above `park_current` (S3.1d needs them in the slot
+        // hand-over as well); the request body below uses those same ones.
         {
             // what is left once everything is allocated: under WDDM a GPU filled to the brim does not fail, it pages -
             // and a page-in while the verify graph spins on a host flag stalls the request for good
@@ -4071,7 +5114,9 @@ int main(int argc, char** argv) {
                         "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
                         "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
-                        "conversation_cache_min_free_mib=%lld engine=" STRATA_VERSION "\n",
+                         "conversation_cache_min_free_mib=%lld slots=%d slots_active=0 concurrency=%d "
+                         "slot_swap=%d "
+                         "engine=" STRATA_VERSION "\n",
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
                                          ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
@@ -4081,37 +5126,100 @@ int main(int argc, char** argv) {
                         o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(),
                         (long long) ((o.mmap_experts ? src.resident_bytes() : strata::kernels::cpu::expert_layout().total) >> 20),
                         pool.workers(), o.pcie_frac,
-                        o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
-                        (long long) o.conversation_cache_min_free_mib);
+                        o.spec_min_p, (long long) (conversations.budget() >> 20), o.conversation_cache_slots,
+                         (long long) o.conversation_cache_min_free_mib, slots, tagged ? 1 : 0,
+                         strata::program::serve_swap::swaps_disabled_by_env() ? 0 : (tagged ? 1 : 0));
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
         // GPU spinning forever.  STRATA_WATCHDOG_S=0 turns it off.  Issue #31: before it does, it reports what every
         // part was doing (stall_report), so one occurrence says where the wait is.
         {
-            const char* ws = std::getenv("STRATA_WATCHDOG_S");
-            const int limit = ws ? std::atoi(ws) : 60;   // one step (a prompt layer, a verify window) takes seconds
-            if (limit > 0)
-                std::thread([limit] {
-                    strata::core::Progress& p = strata::core::progress();
-                    uint64_t last = p.beats.load(), ticks_at = p.ticks.load();
-                    auto since = std::chrono::steady_clock::now();
-                    for (;;) {
-                        std::this_thread::sleep_for(std::chrono::seconds(1));
-                        const auto now = std::chrono::steady_clock::now();
-                        const uint64_t b = p.beats.load();
-                        if (!p.busy.load() || b != last) { last = b; ticks_at = p.ticks.load(); since = now; continue; }
-                        if (now - since < std::chrono::seconds(limit)) continue;
-                        std::fprintf(stderr, "strata serve: no progress for %d s during a request (%s %lld) - stopping "
-                                             "the engine so the server starts it again (issue #29)\n",
-                                     limit, p.where.load(), (long long) p.detail.load());
-                        stall_report(stderr, p.ticks.load() - ticks_at);
-                        std::fflush(stderr);
-                        std::abort();
-                    }
-                }).detach();
-        }
-        std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
+             const char* ws = std::getenv("STRATA_WATCHDOG_S");
+             watchdog_limit_s = ws ? std::atoi(ws) : 60;   // one step (a prompt layer, a verify window) takes seconds
+             if (watchdog_limit_s > 0)
+                 std::thread([limit = watchdog_limit_s, tagged] {
+                     strata::core::Progress& p = strata::core::progress();
+                     uint64_t last = p.beats.load(), ticks_at = p.ticks.load();
+                     auto since = std::chrono::steady_clock::now();
+                     for (;;) {
+                         std::this_thread::sleep_for(std::chrono::seconds(1));
+                         const auto now = std::chrono::steady_clock::now();
+                         const uint64_t b = p.beats.load();
+                         if (!p.busy.load() || b != last) { last = b; ticks_at = p.ticks.load(); since = now; continue; }
+                         if (now - since < std::chrono::seconds(limit)) continue;
+                         // ---- S3.1e-2, risk R3: with the concurrent driver, WHICH slots stalled? ----
+                         // `beats` is process-wide, so a frozen counter means NO slot moved - which with
+                         // one engine thread means the thread is stuck inside one step.  The per-slot
+                         // view still matters: a slot the driver has not run for many times the limit is
+                         // the one that is actually stuck, and the others are merely starved behind it.
+                         // Aborting is right only when there is nothing else to save; naming the slots is
+                         // right always.
+                         if (tagged) {
+                             const int64_t now_ms = strata::core::progress_now_ms();
+                             std::vector<strata::program::serve_driver::SlotWatch> snap;
+                             std::vector<int64_t> kill_left;
+                             {
+                                 std::lock_guard<std::mutex> lk(watch_mu);
+                                 snap = watch;
+                                 // The driver drains `watch_kill` between steps.  Anything still here on
+                                 // the next pass means the engine thread never came back - it is stuck
+                                 // INSIDE a step, which is exactly issue #29 - and no request-level
+                                 // unwind is going to happen.  Escalate.
+                                 for (const int64_t id : watch_kill) kill_left.push_back(id);
+                             }
+                             const std::vector<int64_t> stalled = strata::program::serve_driver::stalled_slots(
+                                 snap, now_ms, last, (int64_t) limit * 1000);
+                             if (!kill_left.empty()) {
+                                 std::fprintf(stderr, "strata serve: no progress for %d s and the driver did not act on "
+                                                      "the %zu stalled slot(s) it was told about (%s) - the engine "
+                                                      "thread itself is stuck; stopping it (issue #29)\n",
+                                              limit, kill_left.size(),
+                                              strata::program::serve_driver::stalled_list(kill_left).c_str());
+                                 stall_report(stderr, p.ticks.load() - ticks_at);
+                                 std::fflush(stderr);
+                                 std::abort();
+                             }
+                             if (!stalled.empty() &&
+                                 !strata::program::serve_driver::watchdog_aborts(stalled, snap.size())) {
+                                 // Not every watched slot is responsible: give up on THOSE requests and
+                                 // keep the engine and the other conversations alive.  The driver turns
+                                 // these into `ERR <id>` + slot destruction between steps; if it cannot
+                                 // (because it is the thing that is stuck), the pass above aborts.  `since`
+                                 // is NOT reset, so that escalation is one second away, not another limit.
+                                 std::fprintf(stderr, "strata serve: no progress for %d s; %s stalled while the "
+                                                      "other slots are current - ending those requests instead of "
+                                                      "the engine (issue #29, stage 3 R3)\n",
+                                              limit, strata::program::serve_driver::stalled_list(stalled).c_str());
+                                 std::fflush(stderr);
+                                 std::lock_guard<std::mutex> lk(watch_mu);
+                                 for (const int64_t id : stalled) watch_kill.push_back(id);
+                                 continue;
+                             }
+                             std::string who;
+                             if (!stalled.empty())
+                                 who = " every slot the driver is watching stalled: " +
+                                       strata::program::serve_driver::stalled_list(stalled) +
+                                       " (" + std::to_string((long long) snap.size()) + " watched)";
+                             std::fprintf(stderr, "strata serve: no progress for %d s during a request (%s %lld)%s - "
+                                                  "stopping the engine so the server starts it again (issue #29)\n",
+                                          limit, p.where.load(), (long long) p.detail.load(), who.c_str());
+                             stall_report(stderr, p.ticks.load() - ticks_at);
+                             std::fflush(stderr);
+                             std::abort();
+                         }
+                         std::fprintf(stderr, "strata serve: no progress for %d s during a request (%s %lld) - stopping "
+                                              "the engine so the server starts it again (issue #29)\n",
+                                      limit, p.where.load(), (long long) p.detail.load());
+                         stall_report(stderr, p.ticks.load() - ticks_at);
+                         std::fflush(stderr);
+                         std::abort();
+                     }
+                 }).detach();
+         }
+        std::printf("%s\n", sp_out.ready(o.max_context, slots).c_str());   // "stop": this engine honours STOP;
+        // "slots=N": it also names requests (S3.1c).  Absent with --serve-slots 0/1, which is what makes an
+        // old server read a new engine exactly as it read 0.1.30 (docs/STAGE3-CONCURRENCY.md §6.4).
         std::fflush(stdout);
         std::string line;
         int64_t rounds = 0;
@@ -4119,6 +5227,12 @@ int main(int argc, char** argv) {
         const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, S) : S;   // the MTP's windows; suffixes go up to S
         if (S_mtp < S) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
+        // S3.1d: the drafter's history IS the sequence (spec/suffix_drafter.hpp:47-48), and `hist_` is
+        // private, so the serve loop keeps a mirror of what it appended.  The mirror is what travels
+        // with a slot; `apply_slot` rebuilds the drafter from it on a mount.  Reserved once so the
+        // decode path allocates nothing new.
+        std::vector<int32_t> sfx_hist;
+        if (tagged) sfx_hist.reserve((size_t) o.max_context + 4096);   // no new allocation at all when off
         strata::spec::DraftPolicy policy(S);   // MTP or lookup window, learned over the whole process
         // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images.  The file is one
         // or more strata-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats) in prompt order;
@@ -4128,77 +5242,1184 @@ int main(int argc, char** argv) {
         bool mrope_identity = true;
         std::vector<float> img_rows;
         std::vector<const float*> row_ptr;
-        while (next_line(line)) {
-            if (line == "QUIT") break;
-            // the watchdog watches a request from here until this iteration ends, whichever way it ends
-            struct BusyScope {
-                BusyScope() { strata::core::progress().busy.store(true); strata::core::progress_at("request"); }
-                ~BusyScope() { strata::core::progress().busy.store(false); strata::core::progress_at("idle"); }
-            } busy_scope;
-            stop_req.store(false);   // a STOP that arrived between requests is stale
-            err.clear();
-            const bool geni = line.rfind("GENI ", 0) == 0;
-            if (!geni && line.rfind("GEN ", 0) != 0) {
-                std::printf("ERR expected: GEN <max_new> <id,id,...> or GENI <max_new> <file> <id,id,...>\n");
-                continue;
+        // ==================== S3.1e-1: the prompt-path helpers, hoisted out of the request body ====
+        // These three only ever captured serve-scope state, so moving them from the request body to the
+        // serve scope changes nothing: same captures, same code, same call sites.  They move because
+        // S3.1e-2's `run_prefill_step` calls them from outside the body, one segment per step, and a
+        // step function cannot reach a lambda declared inside a loop iteration.
+        // A SHORT PART OF THE PROMPT - the new message of a chat that continues from a checkpoint, the assistant
+        // header - goes through the verify windows, S tokens at a time, as decode reads them.  The batched path
+        // costs ~300 ms per run however few tokens it has (it streams every expert the chunk routes to that is
+        // not in VRAM over PCIe), and it borrows slots it must refill after (~180 ms); a window costs ~16 ms a
+        // token, with the misses on the CPU.  Each part below is decided on its own, so a long first message is
+        // read batched and its header still goes through the windows.  Picture rows need the batched path.
+        // STRATA_CKPT_REREAD compares a restored checkpoint with a batched re-read, so it keeps every read batched.
+        static const bool no_short = std::getenv("STRATA_CKPT_REREAD") != nullptr;
+        auto windows_ok = [&](int64_t a, int64_t b) -> bool {
+            if (no_short || b - a > o.short_read) return false;
+            if (sp.embd_rows != nullptr)
+                for (int64_t i = a; i < b; ++i)
+                    if (sp.embd_rows[i] != nullptr) return false;
+            return true;
+        };
+        // tokens [a, b) through the windows: commit all of them, then give the draft layer their residuals
+        auto read_windows = [&](int64_t a, int64_t b, std::string& e) -> bool {
+            strata::core::progress_at("reading the prompt (verify windows), from token", a);   // #217: not "batched"
+            // S3.2b: these ARE verify windows, so they read the DEVICE table (`Verifier::resident_plan`).
+            // Under the lazy loan the host table can have moved since the last upload without any lend or
+            // refill in between - the pump marks rows resident as their copies land - so the table goes out
+            // here too.  `res_upload()` compares content, so when nothing moved this costs a 96 KiB compare.
+            // Order matters: pump first (which is what may have moved it), then upload.
+            if (!pump_loans(e)) return false;
+            reconcile_residency();
+            // every token is committed and the picks are discarded: no head sampling (see set_head_sampling)
+            struct NoHeadSampling {
+                strata::core::Verifier& v;
+                explicit NoHeadSampling(strata::core::Verifier& x) : v(x) { v.set_head_sampling(false); }
+                ~NoHeadSampling() { v.set_head_sampling(true); }
+            } no_head_sampling(ver);
+            std::vector<int32_t> win((size_t) S), outw((size_t) S), nxt((size_t) S);
+            for (int64_t q = a; q < b;) {
+                if (stopped()) { e = "cancelled"; return false; }
+                const int T = (int) std::min<int64_t>(S, b - q);
+                for (int t = 0; t < T; ++t) {
+                    win[(size_t) t] = (int32_t) cur[(size_t) (q + t)];
+                    nxt[(size_t) t] = (int32_t) cur[(size_t) (q + t + 1)];
+                }
+                drive.d.layers = 0;
+                drive.d.experts = 0;
+                drive.d.failed = false;
+                if (!ver.run(T, win.data(), q, win_pool_fn, win_pool_user, outw.data(), e) || drive.d.failed) {
+                    if (drive.d.failed && drive.d.fail) e = drive.d.fail;
+                    return false;
+                }
+                if (!ver.commit(T, e) || !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e)) return false;
+                q += T;
             }
-            char* endp = nullptr;
-            const long long max_new = std::strtoll(line.c_str() + (geni ? 5 : 4), &endp, 10);
+            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
+            std::printf("%s\n", sp_out.pp(b, pp_total, ms,
+                                        ms > 0.0 ? 1000.0 * (double) (b - pp_from) / ms : 0.0,
+                                        req_id).c_str());
+            strata::core::progress_beat();
+            std::fflush(stdout);
+            return true;
+        };
+        // `refill_one`/`refill` moved up next to `apply_pending` (S3.1d): a slot hand-over has to
+        // give the prompt loan back BEFORE it saves the session, so the swap needs them too.  Same
+        // code, declared earlier; every call site below is unchanged.
+        // lend the slots `tokens` batched prompt tokens need: the prompt path's buffers for min(chunk, tokens
+        // rounded up to 256), laid out in the last of the slots it may borrow - per participant, out of that
+        // participant's own cache, and marking only that participant's own layers
+        auto lend = [&](int64_t tokens, std::string& e) -> bool {
+            if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
+            // what this segment needs, capped by the configured chunk: a request lends only what its own
+            // prompt needs, so a large chunk costs a short prompt nothing
+            const int64_t want = request_chunk(tokens, o.prefill_chunk);
+            if (want <= 0) {
+                e = "prefill: cannot lend buffers for an empty request segment";
+                return false;
+            }
+            const auto tlend = Clock::now();
+            bool any = false;
+            int64_t did_relayout = 0, did_grow = 0;
+            for (PfPart& p : pf_parts) {
+                if (p.first < 0) continue;
+                // S3.2b: a pump batch aimed at THIS cache's slots must have landed (or been abandoned)
+                // before the prompt buffers are carved over them.  `pump_loans()` never queues one while a
+                // loan is live, so the only batch that can still be in flight here was queued during the
+                // previous request's decode - and waiting for it is one event, not a stream sync.
+                if (!settle_pump(p, true, e)) return false;
+                // the range this segment's chunk needs, and the layout that would serve it
+                const int32_t first = std::max<int32_t>(p.first, (int32_t) (p.cache->slots() - part_slots(p, want)));
+                const strata::program::prefill_loan::LoanLayout have{p.sp->chunk(), p.first_now};
+                const strata::program::prefill_loan::LoanLayout need{want, first};
+                bool grow = false;
+                // Does the loan already in place cover this segment?  Under the lazy rule the answer is
+                // irrelevant to whether the marking loop has to run (see below), and under the eager rule
+                // "yes" means the whole lend is a no-op - 0.1.30's short-circuit.
+                const bool covers = !p.lent.empty() && want <= p.lent_chunk;
+                // From here this participant's cache is the one the segment's buffers sit in.  Set before
+                // any `continue`: the pump reads this flag, and a stale `false` would let it copy an expert
+                // into a slot the prompt buffers occupy.
+                p.loan_live = true;
+                if (covers && !strata::program::prefill_loan::lend_must_remark(loan_policy))
+                    continue;                                  // its current loan already covers this
+                if (!p.lent.empty() && !covers) {
+                    // S0.3: a bigger segment does not need its loan handed back first.  `part_slots` is
+                    // monotone in the chunk, so the wider range starts no later and already contains every
+                    // row on loan: keep those, add the new ones, and re-lay once.  Handing the loan back
+                    // here would stream the whole range back over PCIe and take it again a moment later.
+                    grow = sticky_loan() && strata::program::prefill_loan::loan_grows(p.first_now, first);
+                    // Handing it back: eager mode does, for a range that is not a superset (0.1.30).  Lazy
+                    // mode does not need to - the rows outside the new range are already non-resident and
+                    // already in the ledger, so they simply stay there and the pump takes them home later.
+                    // `STRATA_PREFILL_STICKY_LOAN=0` still means "give it back first", lazy or not.
+                    if (!grow && (!sticky_loan() ||
+                                  strata::program::prefill_loan::narrow_lend_refills_first(loan_policy)) &&
+                        !refill_one(p, e))
+                        return false;   // ONLY this participant's loan goes back: `refill` would return the
+                                        // other participants' loans too, and their buffers are still laid out
+                                        // in their caches - marking those slots resident again would hand the
+                                        // next window a prompt buffer in place of an expert.  `live_only`
+                                        // because this is a MID-REQUEST hand-back: it returns the rows of
+                                        // this loan, not every row earlier requests left out.
+                }
+                const strata::core::OnDevice on(p.dev);
+                if (strata::program::prefill_loan::needs_relayout(have, need)) {
+                    if (!p.sp->relayout(want, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
+                    p.first_now = first;
+                    ++p.relayouts;
+                    ++did_relayout;
+                } else {
+                    ++p.relayout_skips;   // the layout already in place is the one this segment needs
+                }
+                if (grow) { ++p.loan_grows; ++did_grow; }
+                // MARK THE ROWS OUT, which is the point at which their slots stop holding them.  Nothing
+                // reads the table between the relayout above and here (one engine thread, and no window runs
+                // while a loan is being taken), and nothing reads it after here until the segment's own
+                // residency check - which reads the HOST table, not the device copy.  Under the lazy rule
+                // this loop is also what re-takes the rows the pump may have walked home since the previous
+                // segment, which is why the "my loan already covers this" short-circuit above is skipped in
+                // lazy mode.
+                for (int64_t l = p.lb; l < p.le; ++l) {             // THIS participant's layers only
+                    for (int64_t ex = 0; ex < g.n_expert; ++ex) {
+                        const size_t i = (size_t) (l * g.n_expert + ex);
+                        if (host_res[i] >= first) {
+                            p.lent.emplace_back((int32_t) i, host_res[i]);
+                            // S3.2b: the ledger owns the row from the moment its slot stops holding it.
+                            // `take()` is idempotent, so a row that has been out since the previous request
+                            // is not counted twice - which is the whole cross-request saving: a range that is
+                            // already non-resident marks nothing new.  Eager mode keeps the ledger empty:
+                            // `refill_one` works from `p.lent` there, and populating a 6 481-entry ledger it
+                            // would immediately throw away is a cost the revert arm should not pay.
+                            if (loan_policy.lazy) p.led.take((int32_t) i, host_res[i]);
+                            host_res[i] = strata::core::kNotResident;
+                            any = true;
+                        }
+                    }
+                }
+                p.lent_chunk = want;
+                // The prompt buffers for this segment ARE in this cache's slot range until the loan is
+                // returned.  That is true whether or not the marking loop above found a single row to mark
+                // (under the lazy rule it usually finds none, because the previous request left them out),
+                // and the pump has to know the difference: copying an expert into a slot the buffers occupy
+                // and then marking it resident is invariant (I1) broken in the dangerous direction.
+                p.loan_live = true;
+            }
+            if (loan_timing())
+                std::fprintf(stderr, "strata serve: loan lend: %lld tokens in %.1f ms (%lld relayout, %lld grown, "
+                                     "%zu row(s) now out of the caches)\n",
+                             (long long) want,
+                             std::chrono::duration<double, std::milli>(Clock::now() - tlend).count(),
+                             (long long) did_relayout, (long long) did_grow, loan_outstanding(pf_parts));
+            // S0.3 lever 2: no upload here.  The prompt path decides residency from the HOST table
+            // (`Prefill` holds `host_res`; the CPU pool's adapter reads `drive.d.host_res`), so the
+            // devices' copy is not read until a verify window runs - and `reconcile_residency()` runs at the
+            // top of every window path, every time.  `change()` is bookkeeping for the report only: the skip
+            // decision is a content comparison, so it cannot be fooled by an unannounced write.
+            // STRATA_RES_UPLOAD_ALWAYS=1 reverts this too: upload at lend, as before.
+            if (any) {
+                if (res_upload_always()) res_upload();
+                else res_dirty.change();
+            }
+            return true;
+        };
+
+        // ============================ S3.1d: MOUNT / UNMOUNT A SLOT ============================
+        //
+        // docs/STAGE3-CONCURRENCY.md §5.3: "There is exactly one active slot per layer-split stage.
+        // The captured graphs always point at it.  Changing which conversation is active is a
+        // save/restore, never a re-capture."  Everything the scheduler (S3.1e) will need in order to
+        // put a second conversation into this one session is here, and the pure part of it - the
+        // order, the failure classes, the budget question, the mrope exclusivity - lives in
+        // include/strata/program/serve_swap.hpp where a CPU test can pin it
+        // (src/program/serve_swap_test.cpp, 105 checks).
+        //
+        // WHAT IS AND IS NOT PER-SLOT.  The ConversationCache image is the vehicle for the session's
+        // sequence state: `SavedConversation` already carries `live`, `live_imgs`, `checks` and the
+        // cvec flag, and `conversation_snapshot_restore` puts them back.  So the checkpoint chain is
+        // NOT copied into the slot record - it is a SHARED prefix chain (PR #65's pinned system-prompt
+        // root), and per-slot copies would both break that reuse and cost ~118 MB each.  What the
+        // image cannot carry is what `SlotConv` owns: the suffix drafter's history, the sampling
+        // params and penalty window, the M-RoPE table (R7), the chain's LRU clock and the drafter's
+        // prompt length.
+        //
+        // GATE.  `swaps_on` is false for --serve-slots 0/1 (byte-identical to 0.1.30, §7.1) and for
+        // STRATA_NO_SWAP=1 (the owner's escape hatch: today's serial behaviour, no recompile).  With
+        // the gate off, the request body below runs 0.1.30's park/mount sequence verbatim.
+        const bool swap_env_off = strata::program::serve_swap::swaps_disabled_by_env();
+        const bool swaps_on = tagged && !swap_env_off;
+        if (tagged)   // with --serve-slots 0/1 there is nothing to report: the path is 0.1.30's
+            std::fprintf(stderr, "strata serve: slot swap %s (--serve-slots %d; STRATA_NO_SWAP=1 falls back to "
+                                 "today's serial path)\n",
+                         swaps_on ? "on" : "off", slots);
+        // The per-slot conversation records, keyed by request id.  The engine thread owns every write.
+        // A deque, not a vector: `swap_to` holds references across calls that may add a record, and a
+        // vector reallocation would leave them dangling - the kind of bug that shows up as a wrong
+        // token, not a crash.
+        std::deque<strata::program::serve_swap::SlotConv> conv_slots;
+        auto conv_of = [&](int64_t id) -> strata::program::serve_swap::SlotConv& {
+            for (strata::program::serve_swap::SlotConv& c : conv_slots)
+                if (c.id == id) return c;
+            conv_slots.push_back(strata::program::serve_swap::SlotConv{});
+            conv_slots.back().id = id;
+            return conv_slots.back();
+        };
+        // Which slot the live session reflects right now (§5.3), and who owns the one position table.
+        int64_t mounted_id = strata::program::serve_proto::kNoId;
+        int64_t mrope_owner = strata::program::serve_proto::kNoId;
+        int64_t mtp_prompt_len = 0;   // the mirror of mtp.set_prompt_len(), which has no getter
+        int64_t swap_count = 0, swap_ms_total = 0;
+        int64_t swap_bytes_out = 0, swap_bytes_in = 0;
+        // S3.6: the slots the concurrent driver is holding, and what losing the session would cost
+        // each of them.  The driver adds an entry when it creates a context and refreshes it after
+        // every step from `ReqCtx::phase`; `drop_ctx` removes it.  Empty on the serial and
+        // tagged-serial paths, which is the right answer there: one request at a time means the
+        // outgoing slot is always `finished` and needs no save, exactly as 0.1.30 assumed.
+        //
+        // WHY THE PHASE MAPS THE WAY IT DOES.  `park_current` can only save a branch whose token list
+        // matches the session's positional cells, and it asks that with `live_ok` - which
+        // `prep_request` clears for the WHOLE life of a request ("until this request has finished, the
+        // session is in between") and `finish_request` sets again.  So a mid-request conversation
+        // cannot be saved at all today, whatever the budget.  That is what `not_saveable` means, and
+        // it is why the honest answer for a mid-decode slot is "this hand-over waits", not "this
+        // conversation is destroyed and its slot keeps stepping".
+        std::deque<std::pair<int64_t, strata::program::serve_swap::Outgoing>> working_ids;
+        auto working_of = [&](int64_t id) -> strata::program::serve_swap::Outgoing {
+            for (const auto& w : working_ids) if (w.first == id) return w.second;
+            return strata::program::serve_swap::Outgoing::finished;
+        };
+        auto working_set = [&](int64_t id, strata::program::serve_swap::Outgoing o) {
+            for (auto& w : working_ids) if (w.first == id) { w.second = o; return; }
+            working_ids.push_back({id, o});
+        };
+        auto working_drop = [&](int64_t id) {
+            for (size_t i = 0; i < working_ids.size(); ++i)
+                if (working_ids[i].first == id) { working_ids.erase(working_ids.begin() + (std::ptrdiff_t) i); return; }
+        };
+        // S3.6: what the last `swap_to` did to the two slots it moved between, so the driver can put
+        // each request's `session_valid` back in step.  `swap_to` cannot reach `ReqCtx` (the driver's
+        // `live` deque is declared after it), so the hand-over reports facts and the driver applies
+        // them - which is also what makes the pair testable.
+        //   swap_restored         - the incoming slot's parked image WAS restored: the session now
+        //                           describes it.
+        //   swap_invalidated_out  - the outgoing slot's branch was dropped without a save.  Only
+        //                           reachable for a slot with no work left (the parking guard refuses
+        //                           it otherwise), but the driver still marks the context so the step
+        //                           gate cannot be fooled by a row that outlives its conversation.
+        bool swap_restored = false, swap_invalidated_out = false;
+        // ...and the one question the step gate asks: does the session hold the sequence of whoever
+        // is mounted right now?  A hand-over that restored an image, or a `prep_request` that read or
+        // zeroed the session for its own request, answers yes.  A hand-over that moved the session
+        // without restoring anything answers no - and then the slot the session was taken FROM may
+        // not step, which is the §5.3 invariant `serve_driver::step_gate` enforces.
+        bool session_established = false;
+        // The image the current request will mount, taken out of the cache but not yet restored.
+        std::optional<strata::core::SavedConversation> mount_image;
+        // What the last hand-over did, so the request body neither re-parks the outgoing branch nor
+        // re-mounts an image the swap already restored.
+        bool parked_by_swap = false, mounted_by_swap = false;
+        // Set by the last `swap_to` that failed: the session was already written, so the request must
+        // not retry the hand-over and must not run blind against it.
+        bool swap_wrote_session = false;
+        // S3.6: set by the last `swap_to` that refused BECAUSE the outgoing conversation could not be
+        // saved.  The caller must NOT recover from that the way it recovers from a bad snapshot - the
+        // retry-without-a-restore is exactly what destroys a running conversation.  The incoming
+        // request is answered with an ERR naming both numbers instead.
+        bool swap_park_refused = false;
+        // ...and WHICH kind, so the driver can tell "never parkable here" (answer the incoming
+        // request) from "not saveable yet" (the incoming request waits).  Same enum the guard
+        // computed, so the two cannot drift apart.
+        strata::program::serve_swap::ParkRefusal swap_park_kind =
+             strata::program::serve_swap::ParkRefusal::none;
+         // S3.7: the two numbers from the last refused hand-over, so a later `step_gate` ERR can name
+         // what was actually true instead of blaming the budget by default.  0 = never measured.
+         uint64_t swap_park_snapshot = 0, swap_park_budget = 0;
+        // A hand-over that did not use the image gives it BACK to the cache.  Dropping it would throw
+        // away a parked conversation the next request of that chat would otherwise re-read.
+        auto return_mount_image = [&]() {
+            if (mount_image == std::nullopt) return;
+            // `put` may prune the least recently used conversation to make room, and it can refuse if
+            // the budget closed in the meantime.  Both are the cache's normal policy; only the second
+            // loses a conversation, so it is the one worth saying out loud.
+            // S3.9: and it goes back with the CLAIM it came with.  `mount_image` was taken out of the
+            // cache, not un-owned; re-parking it unclaimed would let the next prefix-matching request
+            // steal the branch of the slot that is still waiting for it.
+            const int64_t back_owner = mount_image->owner;
+            if (!conversations.put(std::move(*mount_image), back_owner))
+                std::fprintf(stderr, "strata serve: swap: the image taken for request %lld would not fit back "
+                                     "in the cache - it is dropped and that conversation re-reads\n",
+                             (long long) req_id);
+            mount_image.reset();
+        };
+        // S3.9: a parked entry is CLAIMED by the request whose branch it is, for exactly as long as
+        // that request is running.  The claim is what stops another request - one whose prompt happens
+        // to share a prefix - from `take()`ing the whole entry and destroying a live conversation.
+        // When the request goes away its branch must become reusable again, or stage 2's prefix
+        // mechanism (the next request of the same chat resumes from it) would silently stop working and
+        // the cache would fill with entries nobody may mount.  `mount_image` is the one entry that is
+        // out of the cache at the time, so its claim has to be cleared by hand.
+        auto release_conv_claims = [&](int64_t id) {
+            conversations.release_owner(id);
+            if (mount_image != std::nullopt && mount_image->owner == id)
+                mount_image->owner = strata::core::kNoOwner;
+        };
+        // The claim a park should attach to this branch, or `kNoOwner`.  A slot that still owes a step
+        // (`working_of` != finished) is one the driver will come back to, and its parked entry is the
+        // only copy of its conversation - so it must not be handed to another request.  A slot with no
+        // work left is finished: its branch is warm storage for the NEXT request of that chat, which
+        // is stage 2's whole point, and claiming it then would freeze the cache.
+        auto park_owner_for = [&](int64_t id) -> int64_t {
+            if (!swaps_on) return strata::core::kNoOwner;
+            return working_of(id) == strata::program::serve_swap::Outgoing::finished
+                       ? strata::core::kNoOwner : id;
+        };
+        // A record exists only while its registry row does, or while it is the mounted one.  A finished
+        // conversation's parked image is found by `ConversationCache::best()` on its token prefix -
+        // that is stage 2's mechanism and it needs no record - so keeping rows for requests that are
+        // gone would grow without bound (request ids are the client's to choose).
+        auto prune_conv = [&]() {
+            for (size_t i = 0; i < conv_slots.size();) {
+                const int64_t id = conv_slots[i].id;
+                bool keep = id == mounted_id;
+                {
+                    std::lock_guard<std::mutex> lk(slot_mu);
+                    keep = keep || slots_reg.find(id) != nullptr;
+                }
+                if (keep) { ++i; continue; }
+                conv_slots.erase(conv_slots.begin() + (std::ptrdiff_t) i);
+            }
+        };
+        // Snapshot of the process-wide conversation variables for whichever slot is mounted.  Called at
+        // the moments 0.1.30 already updates them, so the mirror can never disagree with the session.
+        auto sync_conversation = [&]() {
+            if (mounted_id == strata::program::serve_proto::kNoId) return;
+            strata::program::serve_swap::SlotConv& c = conv_of(mounted_id);
+            c.live = live;
+            c.live_imgs = live_imgs;
+            c.checks = checks;
+            c.cvec_cached = cvec_cached;
+            c.live_ok = live_ok;
+            c.check_clock = check_clock;
+            if (o.suffix_draft > 0) c.sfx_hist.assign(sfx_hist.begin(), sfx_hist.end());
+            c.prompt_len = mtp_prompt_len;
+        };
+        // R7, and it has to happen BEFORE the request body rebuilds the table: `mrope_host` is ONE
+        // buffer for the process, so the outgoing slot's positions must be copied out of it before a
+        // new request overwrites them.  There is no way to recover them afterwards.
+        auto sync_positions = [&]() {
+            if (mounted_id == strata::program::serve_proto::kNoId) return;
+            strata::program::serve_swap::SlotConv& c = conv_of(mounted_id);
+            c.mrope_image = !mrope_identity;
+            c.mrope = mrope_identity ? std::vector<int32_t>{} : mrope_host;
+        };
+        // Put a slot's non-snapshot state back into the process variables.  The snapshot itself is
+        // restored by the mount hook; this is the part the snapshot does not carry.
+        // R7, on its own: put a slot's positions back into the ONE host table.  Split out because the
+        // request body's bail-out guard needs the positions and nothing else - it must not rebuild the
+        // suffix drafter or re-dispatch sampling for a request that never started.
+        auto apply_positions = [&](const strata::program::serve_swap::SlotConv& c) {
+            mrope_identity = !c.mrope_image;
+            if (c.mrope_image && !c.mrope.empty()) mrope_host = c.mrope;
+            else if (!c.mrope_image && !mrope_host.empty()) {
+                const int64_t cells = (int64_t) mrope_host.size() / 3;
+                for (int64_t i = 0; i < cells; ++i)
+                    mrope_host[(size_t) i * 3] = mrope_host[(size_t) i * 3 + 1] =
+                        mrope_host[(size_t) i * 3 + 2] = (int32_t) i;
+            }
+        };
+        // `restore_positions` is false when the caller is a REQUEST LINE, because the request body has
+        // already rebuilt the table for this request (0.1.30's rule: a text request resets it to the
+        // identity, an image request writes its own).  It is true for a scheduler-driven hand-over
+        // (S3.1e), where nothing else can put the slot's positions back.
+        auto apply_slot = [&](const strata::program::serve_swap::SlotConv& c, bool restore_positions) {
+            // A request line rebuilds the drafter from its own prompt below (0.1.30's `sfx.reset()` +
+            // append of every prompt id), so rebuilding it here too would be pure waste.  Only a
+            // scheduler-driven hand-over - which has no prompt to rebuild from - needs this.
+            if (restore_positions) {
+                sfx_hist = c.sfx_hist;
+                sfx.reset();
+                if (!sfx_hist.empty()) sfx.append(sfx_hist.data(), sfx_hist.size());
+            }
+            // The checkpoint chain is SHARED by design (the pinned system-prompt root, PR #65), so its
+            // LRU clock is process-wide: take the slot's clock only to move it FORWARD, never to rewind
+            // it.  A restored chain carries its own `used` stamps, and rewinding the clock would make
+            // a fresh checkpoint older than the ones already in the chain.
+            if (c.check_clock > check_clock) check_clock = c.check_clock;
+            // §3.5: sampling is applied at DISPATCH, never at parse time.  A request line dispatches
+            // its own params a few lines below (0.1.30's `ver.set_sampling`), so only a
+            // scheduler-driven hand-over has to put the slot's back here.
+            if (c.smpl_set) {
+                ver.set_sampling(c.smpl);
+                mtp.set_draft_sampling(c.smpl);
+                const int ph = std::min(c.penalty_last_n, kPenaltyWindowCap);
+                ver.set_history(ph > 0 ? d_hist : nullptr, ph);
+                drive.d.pcie_num = c.pcie_num;
+            }
+            if (!restore_positions) return;
+            apply_positions(c);
+            if (c.prompt_len > 0) mtp.set_prompt_len(c.prompt_len);
+        };
+        // THE HAND-OVER.  `incoming_id` becomes the mounted slot; its parked image, if any, is
+        // restored into the session.  Returns false when the swap could not complete; `poisoned`
+        // reports the one case where the session may not be used afterwards (a failed restore -
+        // 0.1.30's rule, kept fatal).
+        //
+        // S3.6 - THE PARKING GUARD, and what losing the session would cost the slot it reflects.
+        // `working_of(mounted_id)` is the driver's answer, derived from that slot's `ReqCtx::phase`;
+        // the serial path has no entries at all, so it reads `finished` and the guard is inert there -
+        // which is what keeps --serve-slots 0/1 behaving exactly as 0.1.30 does.
+        //
+        //   * finished    - the request is over.  It needs no save: the client has its answer and a
+        //                   later request of the same chat finds the branch through
+        //                   `ConversationCache::best()`, exactly as stage 2 always did.  The hand-over
+        //                   always proceeds, budget or no budget; losing the in-session copy costs
+        //                   reuse, not a conversation.
+        //   * re_readable - mid-prompt.  Its whole prompt is still in `ReqCtx::ids`, so the hand-over
+        //                   may proceed WITHOUT a save - but only because the driver then sends that
+        //                   request back to token 0 (`reset_request_to_token0`).  Continuing the read
+        //                   where it left off, against a session whose cells now hold somebody else's
+        //                   prefix, is the same silent-garbage failure one segment later.
+        //   * must_park   - mid-decode.  The tokens it generated are already on the wire, so its
+        //                   prompt cannot be re-read without emitting them twice: its state MUST be
+        //                   saved.  If it cannot be, the hand-over is REFUSED before the unmount hook
+        //                   runs - the session is left exactly as it was, because the guard runs
+        //                   before `validate` and `unmount` and both only read - and the caller
+        //                   answers the INCOMING request instead of starving it or spinning on it.
+        //
+        // Destroying a running conversation and letting its slot keep stepping against the next one's
+        // session is the bug this exists to make impossible.
+        auto swap_to = [&](int64_t incoming_id, std::string& serr, bool& poisoned,
+                           bool restore_positions = true) -> bool {
+            poisoned = false;
+            swap_wrote_session = false;
+            swap_park_refused = false;
+            swap_park_kind = strata::program::serve_swap::ParkRefusal::none;
+            swap_invalidated_out = false;
+            swap_restored = false;
+            // The tested predicate (`serve_swap::swap_needed`), so the decision the CPU test pins is
+            // the one production makes.  Staying on the mounted slot is the default and the cheap
+            // answer: one swap is a full save+restore of a 237 MB-2.25 GB image (risk R10).
+            if (!swaps_on || !strata::program::serve_swap::swap_needed(mounted_id, incoming_id)) return true;
+            // `mounted_id == kNoId` means nothing is mounted yet (the first request of the process):
+            // there is no outgoing record, and creating one keyed kNoId would strand it forever.
+            strata::program::serve_swap::SlotConv& in = conv_of(incoming_id);
+            const bool have_out = mounted_id != strata::program::serve_proto::kNoId;
+            strata::program::serve_swap::SlotConv& out = have_out ? conv_of(mounted_id) : in;
+            // S3.6: what losing the session would cost the slot the session reflects.  `finished` on
+            // the serial path (nothing is in `working_ids`), so the guard is inert there and 0.1.30's
+            // behaviour - park if you can, re-read if you cannot - is untouched.
+            const strata::program::serve_swap::Outgoing out_state =
+                have_out ? working_of(mounted_id) : strata::program::serve_swap::Outgoing::finished;
+            // R7, as an acquired resource and not an assumption: the one position table belongs to the
+            // mounted slot.  A hand-over that would leave a non-identity holder mounted is refused.
+            const bool saving_out = have_out &&
+                                    strata::program::serve_swap::save_for(out, conversations.enabled()) ==
+                                        strata::program::serve_swap::Save::park;
+            if (!strata::program::serve_swap::mrope_exclusive_ok(out, incoming_id, saving_out)) {
+                serr = "the image position table is held by slot " + std::to_string((long long) mounted_id);
+                return false;
+            }
+            // S3.6 — THE PARKING GUARD, and it runs BEFORE anything can destroy the outgoing branch.
+            //
+            // What used to happen: the unmount hook let `park_current` fail, `invalidate_unparked`
+            // cleared the outgoing branch, the hand-over reported SUCCESS, and the outgoing slot's
+            // conversation existed nowhere.  Its request was still running, so the next pick stepped it
+            // against a session holding ANOTHER conversation's K/V and positions: garbage tokens,
+            // usually an immediate EOS, and no error anywhere.  The log promised "will be re-read from
+            // token 0" and nothing ever kept that promise.
+            //
+            // The rule now, in the order the two facts arrive:
+            //
+            //   * a slot with NO work left needs no save.  Its client already has the answer and a
+            //     later request of the same chat finds the branch through `ConversationCache::best()`,
+            //     exactly as stage 2 always did.  Dropping its in-session image costs reuse, not a
+            //     conversation, so the hand-over proceeds and says so on one line.
+            //   * a slot WITH work left may only be swapped out if its state can actually be saved.
+            //     "Can be saved" has two halves, and BOTH are checked here rather than discovered by
+            //     a failed save: the session must hold a whole branch the cache could take
+            //     (`save_for == Save::park`, which is `park_current`'s own first guard), and the
+            //     snapshot must fit the parking budget (`budget_of`/`budget_has_room`, which mirror
+            //     `ConversationCache::make_room`).  A refusal leaves the session exactly as it was -
+            //     the guard runs before `validate` and `unmount`, and both only read.
+            //
+            // The two refusals are different and the driver treats them differently:
+            //   * `budget_too_small` - never parkable here.  The incoming request is ANSWERED with an
+            //     ERR naming both numbers, not starved and not spun on.
+            //   * `not_saveable`     - the session is mid-read, so there is no whole branch to take
+            //     yet.  That clears itself when the running request ends, so the incoming request
+            //     WAITS.  ERRing it would punish a client for a race that resolves on its own;
+            //     swapping anyway is what used to destroy a running conversation.
+            strata::program::serve_swap::ParkCheck parkchk;
+            const bool park_guard_on = have_out &&
+                strata::program::serve_swap::save_is_mandatory(out_state);
+            // A slot whose conversation was NOT parked on its way out has no image to come back to.
+            // That is not an error and it must not refuse the hand-over: the request simply re-reads
+            // from token 0, which is the request body's job.  What must never happen is a restore for
+            // such a slot, so the image is dropped here rather than trusted.
+            if (!strata::program::serve_swap::can_mount(in) && mount_image != std::nullopt) {
+                std::fprintf(stderr, "strata serve: swap: slot %lld is not resumable - its parked image was "
+                                     "pruned or never stored; re-reading from token 0\n",
+                             (long long) incoming_id);
+                return_mount_image();
+            }
+            strata::program::serve_swap::Plan plan;
+            plan.save = saving_out;
+            plan.mount = mount_image != std::nullopt;
+            plan.draft_kv = plan.mount;
+            plan.adopt = true;
+            plan.device_state = true;
+            plan.park_guard = park_guard_on;
+            strata::program::serve_swap::Hooks h;
+            // What this hand-over actually moved, for the report below.  The hooks fill them.
+            int64_t rep_saved = 0, rep_restored = 0;
+            // 1. drain the in-flight expert-cache swaps (risk R9).  A swap resets the KV page tables,
+            //    and a half-applied residency table is the silent failure expert_cache.hpp:135-138 warns
+            //    about.  `apply_pending(true)` also re-uploads `host_res` if it moved.
+            h.drain_residency = [&](std::string&) { apply_pending(true); return true; };
+            // 2. return the prompt loan (risk R8).  The loan is the tail of ONE cache; a snapshot taken
+            //    while it is lent describes a cache that does not exist.
+            h.return_loan = [&](std::string& e) { return refill(e); };
+            // 3. S3.6: can the outgoing conversation be saved at all?  Asked here, after the loan is
+            //    back and before the validate/save/restore, because everything from `unmount` on can
+            //    destroy it.  A refusal costs nothing: the session has only been read.
+            h.park_guard = [&](std::string& e) -> bool {
+                const size_t held = mount_image != std::nullopt ? mount_image->bytes() : 0;
+                // `saveable` is `park_current`'s own first guard, so the two cannot disagree: the
+                // cache takes a branch whose token list matches the session's positional cells
+                // (`live_ok && !live.empty()`), and nothing else.  The driver publishes that for a
+                // mid-decode slot before it asks for a hand-over (`publish_decode_branch`), which is
+                // what makes pre-empting a decoder parkable at all - without it `park_current` has
+                // always refused a mid-request slot, budget or no budget, and every pre-emption has
+                // been destroying a live conversation since S3.1d landed.
+                // Read the SERVE-scope truth, not the slot record's mirror.  `park_current` asks
+                // `live_ok && !live.empty()` on the serve-scope variables, and `SlotConv::live_ok` is
+                // only refreshed by `sync_conversation()` at a few points, so the mirror can be stale
+                // true for a slot whose request has since started reading.  A guard that trusted it
+                // would let a hand-over through and then have `park_current` refuse it - which is the
+                // exact disagreement this whole check exists to remove.
+                const bool saveable = conversations.enabled() && live_ok && !live.empty();
+                size_t est = 0;
+                std::string berr;
+                const strata::core::ConversationView view{live, live_imgs, checks, cvec_cached};
+                if (!strata::core::conversation_snapshot_bytes(view, ss, conv_stages, g,
+                                                               mtp.kv_state(), est, berr)) {
+                    // The snapshot cannot even be sized (a checkpoint whose buffers do not match the
+                    // session, a token count past the session's cells).  `park_current` would refuse it
+                    // for the same reason, so treat that as "does not fit", not as "no problem".
+                    std::fprintf(stderr, "strata serve: park: slot %lld snapshot cannot be sized (%s)\n",
+                                 (long long) out.id, berr.c_str());
+                    est = std::numeric_limits<size_t>::max() / 4;
+                }
+                parkchk = strata::program::serve_swap::park_fits(
+                    strata::program::serve_swap::budget_of(conversations), est, held, out_state, saveable);
+                // S3.7: keep the two numbers at serve scope so a later `step_gate` ERR can quote them.
+                swap_park_snapshot = parkchk.snapshot;
+                swap_park_budget = parkchk.budget;
+                if (parkchk.ok()) return true;
+                swap_park_refused = true;
+                swap_park_kind = parkchk.refusal;
+                // ONE line, unconditionally: the two numbers the owner asked for, at the moment the
+                // decision is made rather than 97 seconds later when a request ends early.
+                std::fprintf(stderr, "%s\n",
+                             strata::program::serve_swap::park_refusal_line(out.id, incoming_id, parkchk).c_str());
+                std::fflush(stderr);
+                e = strata::program::serve_swap::park_refusal_line(out.id, incoming_id, parkchk) +
+                    ".  A slot in the middle of a request cannot be swapped out unless its state can "
+                    "be saved: raise --conversation-cache-mib, lower --max-context, or run this box "
+                    "with --serve-slots 0/1.";
+                serr = e;
+                return false;
+            };
+            // 3. validate BEFORE anything is written - this is what makes "a failed validation leaves
+            //    the outgoing state intact" a property of the order rather than a hope.
+            h.validate = [&](std::string& e) {
+                if (strata::core::conversation_snapshot_validate(*mount_image, ss, conv_stages, g,
+                                                                 mtp.kv_state(), e))
+                    return true;
+                std::fprintf(stderr, "strata serve: swap: discard invalid snapshot (%s)\n", e.c_str());
+                return false;
+            };
+            // 4. unmount: the snapshot save.  It only READS the session, so a failure here leaves
+            //    everything usable and the outgoing slot stays mounted.
+            h.unmount = [&](std::string& e) {
+                // S3.9: the branch being saved here is the OUTGOING slot's, and that slot is still
+                // running - it is about to wait for its session back.  Claim the entry for it, or the
+                // next request whose prompt shares a prefix can mount (and thereby remove) it.
+                const auto saved = park_current(mount_image ? mount_image->bytes() : 0, true,
+                                                park_owner_for(mounted_id));
+                if (saved == strata::program::serve_swap::Saved::failed) { e = err; err.clear(); return false; }
+                parked_by_swap = true;   // the request body must not park this branch again
+                if (saved == strata::program::serve_swap::Saved::stored) {
+                    rep_saved = (int64_t) park_bytes;
+                    out.parked_bytes = (int64_t) park_bytes;
+                    swap_bytes_out += (int64_t) park_bytes;
+                    out.resumable = true;
+                    std::fprintf(stderr, "strata serve: park: slot %lld parked %zu tokens / %lld MiB; "
+                                         "parked=%zu entries, %zu MiB of a %zu MiB budget\n",
+                                 (long long) out.id, out.live.size(), (long long) (park_bytes >> 20),
+                                 conversations.size(), conversations.bytes() >> 20,
+                                 conversations.budget() >> 20);
+                } else if (strata::program::serve_swap::save_is_mandatory(out_state)) {
+                    // S3.6 THE SECOND HALF OF THE GUARD.  The budget pre-check passed, but the save
+                    // still did not store: physical-RAM admission refused it, `put` refused it, or the
+                    // capture was skipped for a reason the estimate could not see.  A slot that still
+                    // owes a step may NOT be destroyed by that, so the hand-over fails HERE -
+                    // `unmount` only reads the session, so `serve_swap::run` reports the session intact
+                    // and the caller answers the incoming request with an ERR instead of starving it.
+                    serr = "slot " + std::to_string((long long) mounted_id) + " could not be parked (" +
+                           std::to_string(out.live.size()) + " tokens, " +
+                           std::to_string((long long) (parkchk.snapshot >> 20)) + " MiB snapshot vs a " +
+                           std::to_string((long long) (parkchk.budget >> 20)) +
+                           " MiB parking budget) and it still has work to do";
+                    std::fprintf(stderr, "strata serve: park: slot %lld NOT parked although the budget looked "
+                                         "enough (%zu tokens, %lld MiB snapshot vs a %lld MiB budget) - "
+                                         "hand-over aborted, the session is untouched\n",
+                                 (long long) out.id, out.live.size(),
+                                 (long long) (parkchk.snapshot >> 20),
+                                 (long long) (parkchk.budget >> 20));
+                    swap_park_refused = true;   // same handling as the guard's refusal: never retry blind
+                    // The budget looked enough but the save did not store - physical-RAM admission,
+                    // or `put` refusing.  That clears itself when RAM frees, so it is the WAIT kind,
+                    // not the NEVER kind.
+                    swap_park_kind = strata::program::serve_swap::ParkRefusal::not_saveable;
+                    return false;
+                } else {
+                    // S3.6: the outgoing slot's branch is dropped without a save, and that is allowed
+                    // for exactly TWO reasons, both decided by `out_state` before anything was
+                    // destroyed:
+                    //   * `finished`    - the request is over, so no step can ever run against a
+                    //     stale session.  Dropping the in-session copy costs reuse, not a
+                    //     conversation: a later request of the same chat finds the branch through
+                    //     `ConversationCache::best()`, exactly as stage 2 always did.
+                    //   * `re_readable` - the request is mid-prompt and its whole prompt is still in
+                    //     `ReqCtx::ids`.  `serve_driver::step_gate` sees `resumable == false` and
+                    //     sends it back to token 0 (`reset_request_to_token0`), which is the promise
+                    //     this log line has always made and never kept.
+                    // A slot in `decode` reaching this line is the bug; the guard above refuses it.
+                    strata::program::serve_swap::invalidate_unparked(out);
+                    swap_invalidated_out = true;
+                    const bool over = out_state == strata::program::serve_swap::Outgoing::finished;
+                    std::fprintf(stderr, "strata serve: swap: slot %lld NOT parked (%zu tokens, %lld MiB snapshot "
+                                         "vs a %lld MiB budget) - %s\n",
+                                 (long long) out.id, out.live.size(),
+                                 (long long) (parkchk.snapshot >> 20),
+                                 (long long) (parkchk.budget >> 20),
+                                 over ? "its request is over, so nothing will step against it and a later "
+                                        "request of this chat re-reads from the cache"
+                                      : "it is mid-prompt, so it will be RE-READ from token 0");
+                    std::fflush(stderr);
+                }
+                return true;
+            };
+            // 5. mount: the snapshot restore.  Pre-validated, so a failure here is a transfer failure
+            //    and the session is finished for this process.
+            h.mount = [&](std::string& e) {
+                const auto t0 = Clock::now();
+                const auto res = strata::core::conversation_snapshot_restore(*mount_image, ss, conv_stages, g,
+                                                                            mtp.kv_state(), e);
+                if (res != strata::core::ConversationRestore::restored) { poisoned = true; return false; }
+                rep_restored = (int64_t) mount_image->bytes();
+                swap_bytes_in += rep_restored;
+                live = std::move(mount_image->live.ids);
+                live_imgs = std::move(mount_image->live.imgs);
+                checks = std::move(mount_image->checkpoints);
+                cvec_cached = mount_image->cvec;
+                live_ok = !live.empty();
+                if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr)
+                    conversations.retain(std::move(mount_image->kv), int64_t(live.size()));
+                mount_image.reset();
+                mounted_by_swap = true;   // the request body must not re-run the parked-prefix search
+                swap_restored = true;    // S3.6: the session now describes the incoming slot
+                std::fprintf(stderr, "strata serve: swap: mounted slot %lld, %zu tokens in %.1f ms; "
+                                     "parked=%zu bytes=%zu\n",
+                             (long long) incoming_id, live.size(),
+                             std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                             conversations.size(), conversations.bytes());
+                return true;
+            };
+            // 6. the drafter's ring may hold cells past the resume point from a longer turn.
+            h.draft_kv = [&](std::string&) { if (!live.empty()) mtp.kv_restore((int64_t) live.size()); return true; };
+            // 7. the per-slot state the snapshot does not carry.
+            h.adopt = [&](std::string&) {
+                // No restore happened, so the session's POSITIONAL cells still hold the OUTGOING
+                // conversation's tokens.  Nothing the incoming slot inherits from them may be used:
+                // a checkpoint is only valid while the cells below it still hold its tokens.  Clear
+                // the branch and the chain, and the request body reads from token 0 - the honest
+                // answer, and the one that cannot produce plausible garbage.
+                if (!plan.mount) {
+                    live.clear();
+                    live_imgs.clear();
+                    checks.clear();
+                    live_ok = false;
+                }
+                in.live = live; in.live_imgs = live_imgs; in.checks = checks;
+                in.cvec_cached = cvec_cached; in.live_ok = live_ok;
+                in.resumable = true;   // whatever it was, it now describes the session again
+                apply_slot(in, restore_positions);
+                return true;
+            };
+            // 8. the per-slot DEVICE state the session depends on: the one position table (R7) and the
+            //    control-vector mode.  Sampling is re-dispatched by the request body at dispatch time
+            //    (§3.5), never here.
+            h.device_state = [&](std::string&) {
+                if (strata::kernels::cvec().loaded()) strata::kernels::cvec_set_enabled(in.cvec_cached);
+                // The table only exists with --vision; without it every slot holds the identity and
+                // there is nothing to hand over - but ownership still moves, so the predicate stays
+                // honest and a later --vision session cannot inherit a stale owner.
+                if (strata::program::serve_swap::mrope_upload_needed(mrope_owner, incoming_id)) {
+                    if (!mrope_host.empty() && !upload_mrope_table()) { serr = "the position table upload failed"; return false; }
+                    mrope_owner = incoming_id;
+                }
+                return true;
+            };
+            const auto tswap = Clock::now();
+            const strata::program::serve_swap::Report rep = strata::program::serve_swap::run(plan, h, serr);
+            const int64_t ms = (int64_t) std::chrono::duration<double, std::milli>(Clock::now() - tswap).count();
+            // Report every swap on stderr with the bytes moved and the milliseconds, and count them, so
+            // the owner can price OQ3 (the real swap cost per token count) at a restart.
+            std::fprintf(stderr, "strata serve: swap %lld: slot %lld -> %lld %s in %lld ms; saved %lld B, "
+                                 "restored %lld B, parked=%zu bytes=%zu (total %lld swaps, %lld ms, "
+                                 "%lld B out / %lld B in)\n",
+                         (long long) (swap_count + 1), (long long) mounted_id, (long long) incoming_id,
+                         rep.ok ? "ok" : strata::program::serve_swap::fault_name(rep.fault),
+                         (long long) ms, (long long) rep_saved, (long long) rep_restored,
+                         conversations.size(), conversations.bytes(),
+                         (long long) (swap_count + 1), (long long) (swap_ms_total + ms),
+                         (long long) swap_bytes_out, (long long) swap_bytes_in);
+            if (trace) {
+                std::string steps;
+                for (strata::program::serve_swap::Step st : rep.ran) steps += std::string(" ") +
+                                                                            strata::program::serve_swap::step_name(st);
+                std::fprintf(stderr, "strata trace: swap steps:%s\n", steps.c_str());
+            }
+            swap_count++;
+            swap_ms_total += ms;
+            {
+                std::lock_guard<std::mutex> lk(slot_mu);
+                slots_reg.note_swap(ms);
+                // /slots and the SLOT line report what each slot costs in the cache (§6.2's
+                // `parked_bytes`), so the owner can see a swap's price without grepping stderr.
+                if (strata::program::slot::Slot* sl = slots_reg.find(incoming_id))
+                    sl->parked_bytes = in.parked_bytes;
+                if (have_out)
+                    if (strata::program::slot::Slot* sl = slots_reg.find(mounted_id))
+                        sl->parked_bytes = out.parked_bytes;
+            }
+            if (!rep.ok) {
+                // A failure AT OR AFTER the restore means the session already holds the incoming
+                // conversation, whether or not the hand-over finished.  Say so, and say so to the
+                // caller: `mounted_id` must describe the session or the next save would write the
+                // wrong branch out of it, and a request may NOT retry a hand-over that already
+                // restored - the second attempt would save the incoming branch as if it were the
+                // outgoing one.  (A failure BEFORE it - drain, validation, save - left the session
+                // alone, and the caller may retry without an image.)
+                if (!rep.session_intact) {
+                    swap_wrote_session = true;
+                    mounted_id = incoming_id;
+                    sync_conversation();
+                }
+                return false;
+            }
+            mounted_id = incoming_id;
+            // S3.6: the session describes the incoming slot only if its own state was put into it.
+            // A hand-over with no restore cleared `live`/`checks` (adopt), so the answer is no.
+            session_established = plan.mount;
+            sync_conversation();
+            return true;
+        };
+        // ==================== S3.1e-1: the resumable request ====================
+        //
+        // Stage 3's scheduler (S3.1e-2) cannot run a request as one straight-line block: with two
+        // conversations in one process it must give each of them ONE step at a time and swap the
+        // session between them.  So the request body below is cut into the named steps
+        // (`prep_request`, `run_prefill_step`, `finish_prefill`, `run_decode_step`,
+        // `finish_request`), and the serial loop calls them in exactly the order the old straight-line
+        // code ran.  This is a pure refactor: same order, same captures, same error paths, same
+        // stdout bytes.
+        //
+        // WHY A STRUCT AND NOT A CLASS: `ReqCtx` is only the per-request state the old body kept in
+        // its own locals.  It is constructed INSIDE `while (next_line(line))`, so its lifetime and its
+        // construction/destruction order are exactly those locals' - nothing about when a conversation
+        // image, a slot row or a CUDA buffer exists changes.  The steps are lambdas in the serve scope
+        // because that is where every capture already lives (`ver`, `mtp`, `sp`, `conversations`,
+        // `slots_reg`, ...); a class would have to be handed all of them.
+        //
+        // The moved code keeps its ORIGINAL local names as references into `ReqCtx`, so each step's
+        // body is the old text verbatim apart from the alias declarations and the exit statements.
+        enum class Prep { ok, rejected, fatal };   // rejected: the ERR line is out, take the next line
+                                                   // fatal:    the ERR line is out, the engine exits 1
+        enum class Step { progressed, finished, cancelled, needs_swap, error, fatal_exit };
+        //   progressed  the step did work and there is more of the same step to do
+        //   finished    the step is done; move on to the next phase
+        //   cancelled   the request was STOPped; fall through to the phase's tail, not an error
+        //   needs_swap  RESERVED for S3.1e-2: this step wants the session handed to another slot.
+        //               The serial path never returns it and nothing handles it yet.
+        //   error       the ERR line is already printed; the caller must `return 1` exactly as today
+        //   fatal_exit  #224: a CUDA fault, already flushed; the caller must `std::_Exit(1)`
+
+        // S3.1e-1: the decode-timing snapshot moved out of the request body with the decode step, so
+        // `ReqCtx` can hold one.  Same captures (`ver`, `drive`), same static flag, same fields.
+        static const bool dec_timing = std::getenv("STRATA_DECODE_TIMING") != nullptr;
+        struct DecSnap {
+            double wait, pool, host, plan, actq, jobs, run;
+            int64_t misses, entries, hits, pcie;
+        };
+        auto dec_snap = [&]() {
+            return DecSnap{ver.ms_wait, ver.ms_pool, ver.ms_host, drive.d.ms_plan, drive.d.ms_actq, drive.d.ms_jobs,
+                           drive.d.ms_run, drive.d.multi_misses, drive.d.multi_entries, drive.d.cache_hits,
+                           drive.d.pcie_experts};
+        };
+        struct ReqCtx {
+            // ---- S3.1e-2: what makes the context OUTLIVE a step -------------------------------
+            // The serial path hands this struct one line and runs it to completion inside the same
+            // iteration, so it never needs to remember the line.  The concurrent driver admits a
+            // request in one iteration and steps it in later ones, so the line has to live here:
+            // `prep_request` is called exactly once per request, with the line it was admitted from.
+            std::string line;
+            bool has_line = false;      // `line` is set and has not been consumed yet
+            // Where the resumable body sits.  This is the driver's phase machine
+            // (serve_driver::Phase); the serial path never reads it, it just calls the steps in
+            // 0.1.30's order.
+            strata::program::serve_driver::Phase phase = strata::program::serve_driver::Phase::queued;
+            // A failure the driver could not act on INSIDE a step (returning from a step lambda
+            // would skip the slot's unwind and leak its active-slot permit).  The driver acts on it
+            // as soon as it is back in the loop: 0 = none, 1 = the ERR line is out and the engine
+            // exits 1 (0.1.30's `return 1`), 2 = #224, a CUDA fault already flushed: `_Exit(1)`.
+            int fail = 0;
+            // Has this request reached its end (DONE/ERR out, its image handed to the cache)?  The
+            // per-step `SlotGuard` releases the row only when this is set, which is what makes a
+            // guard armed per STEP instead of per REQUEST possible at all.
+            bool finished = false;
+            // Does THIS request currently hold the one prompt loan (risk R8)?  Set when a batched
+            // segment lends, cleared when `finish_prefill` refills.  The driver keeps
+            // `serve_driver::Loan` in step with it, and this is what makes a slot that dies mid-read
+            // give the loan back rather than strand it.
+            bool loan_held = false;
+            // The RAM this slot was admitted against (the driver's admission estimate).
+            int64_t image_bytes = 0;
+            // S3.6: does the ONE live session still hold THIS request's sequence?  Set true by
+            // `prep_request` (which either restored an image, resumed a checkpoint or zeroed the
+            // session) and by a hand-over that restored this slot's image; cleared by any hand-over
+            // that moved the session elsewhere without restoring this slot's state.  It is the one
+            // fact `serve_driver::step_gate` needs, and it cannot come from `SlotConv`: `live_ok` is
+            // false for every mid-flight request by design, and `resumable` is reset by the adopt
+            // hook.  Only the request knows whether the session is still its own.
+            // S3.6 (§5.3): does the ONE live session still hold THIS request's sequence?
+            //   true  - `prep_request` established it (its own read, or a hand-over restored this
+            //           slot's parked image into the session);
+            //   false - a hand-over moved the session to another slot and did not restore this one's
+            //           image, so the session's positional cells and running state describe somebody
+            //           else's conversation.
+            // It cannot be derived from `SlotConv`: `live_ok` is false for the whole life of a request
+            // by design ("until this request has finished, the session is in between"), and
+            // `resumable` is set back to true by the adopt hook for whatever was just mounted.  Only
+            // the request knows.  `serve_driver::step_gate` reads it before every step.
+            bool session_valid = false;
+            // S3.8: how many times THIS request has been sent back to token 0.  A re-read is an honest
+            // recovery when a branch was lost once; unbounded it is the two-prefill livelock the owner
+            // hit (slot 3 reset 101 times, neither prefill ever finishing), and it looks like progress
+            // to the watchdog because every pass really does read tokens.  So the count is bounded and
+            // the request is ended with a named ERR instead of restarting forever.
+            int rereads = 0;
+            // S3.6: this request's own picture keys.  The serve-scope `req_imgs` names whichever
+            // request was prepped LAST, so a driver that publishes another slot's branch must not
+            // read it - it would attach a different conversation's images to this one's token list,
+            // and the ConversationCache compares them when it looks a branch up.
+            std::vector<ImgKey> own_imgs;
+            // ---- phase 1: the parsed request line
+            strata::program::serve_proto::Request rq;
+            bool geni = false;
+            long long max_new = 0;
+            float req_temperature = 0.0f, req_top_p = 1.0f, req_min_p = 0.0f;
+            float req_penalty_repeat = 1.0f, req_penalty_freq = 0.0f, req_penalty_present = 0.0f;
+            int req_top_k = 20, req_penalty_last_n = 0, req_cvec = 1;
+            unsigned long long req_seed = 0;
+            double req_pcie_frac = 0.0, req_spec_min_p = 0.0;
+            std::string emb_path;
+            std::vector<int64_t> ids;
+            int64_t id = strata::program::serve_proto::kNoId;   // this request's id (== `req_id` while it runs)
+            int64_t n = 0;
+            bool slot_open = false;        // the registry row exists -> SlotGuard must finish it
+            bool mrope_touched = false;    // this request rewrote the one position table
+            // per-request metric baselines (phase 5 prints the deltas)
+            std::array<int64_t, 3> remote_before{}, launches_before{};
+            std::array<uint64_t, 3> compact_before{}, full_before{};
+            std::array<double, 3> begin_before{}, wait_before{};
+            // ---- phase 2: the resume point, the mount, the sampling dispatch
+            Clock::time_point r0{};
+            std::array<int64_t, 6> loan_bill{};
+            int64_t res_uploads0 = 0, res_skips0 = 0;
+            bool want_cvec = true;
+            int64_t resume = 0;
+            bool from_live = false;
+            int64_t reread_to = -1;
+            int64_t read_from = 0;
+            strata::kernels::SamplerParams req_sp;
+            int hist_n = 0;
+            // ---- phase 3: the prompt segments and how far the read has got
+            int64_t turn_at = -1, root_at = -1;
+            std::array<int64_t, 4> seg{{-1, -1, -1, -1}};   // the four segment ends 0.1.30 iterated
+            size_t seg_i = 0;
+            int64_t at = 0;
+            bool cancelled = false;
+            double prompt_ms = 0.0;
+            // S3.1e-2: the prompt-progress state the PP line and the mid-prompt checkpoints read.  It
+            // lives at serve scope because 0.1.30's body wrote it there; the driver mirrors it here so
+            // it can put the RIGHT request's values back before each prefill step.
+            int64_t pp_total = 0, pp_from = 0, pp_next_check = 0;
+            Clock::time_point pp_t0{};
+            // ---- phase 4: the decode loop's state (`finish_prefill` sets it up, `run_decode_step`
+            // advances it one verify window at a time).  The vectors are sized once per request, never
+            // per token, so the decode hot path allocates nothing new.
+            int64_t p = 0;
+            int32_t x = 0;
+            std::vector<int32_t> drafts, window, outv, sbuf, consumed;
+            std::vector<float> dprob;
+            bool first_window = true;
+            int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
+            int64_t draft_offered = 0, draft_accepted = 0;
+            const char* finish = "length";
+            Clock::time_point d0{};
+            DecSnap ds0{};
+            double dt_run = 0, dt_commit = 0, dt_draft = 0;
+            int64_t dec_windows = 0, dec_T = 0;
+            int64_t decode_hits0 = 0, decode_look0 = 0;
+            double decode_ms = 0.0;
+        };
+        // The two iteration guards.  They stay INSTANTIATED in the loop body: their destructors must
+        // run at the end of the whole iteration, exactly as the old locals' did.  Only their definitions
+        // move out, so a body-local instance can be armed from inside `prep_request` through `ReqCtx`.
+        // The values they read at destruction (`slot_open`, `mrope_touched`) are never written after
+        // setup, so reading them from the context is the same answer as the old constructor argument.
+        struct SlotGuard {
+            ReqCtx* ctx = nullptr;
+            std::function<void(int64_t)> finish;
+            ~SlotGuard() { if (ctx && ctx->slot_open && finish) finish(ctx->id); }
+        };
+        struct MropeScope {
+            std::function<bool()> skip;     // this request IS the mounted slot: nothing to undo
+            std::function<void()> restore;
+            ~MropeScope() { if (skip && skip()) return; if (restore) restore(); }
+        };
+        // ---- S3.6: publish a running request's branch so a hand-over CAN save it ----------------
+        //
+        // THE REAL ROOT CAUSE, and it is not the budget.  `park_current`'s first guard is the
+        // serve-scope `live_ok`, and `live`/`live_ok` describe the branch the SESSION holds as a
+        // resumable conversation.  `prep_request` clears `live_ok` for the WHOLE life of a request
+        // ("until this request has finished, the session is in between") and `finish_request` is the
+        // only thing that puts the request's own branch into `live` (`live.swap(consumed)`).  So for
+        // every request in `prefill` or `decode`, `park_current` returned `skipped` - at ANY budget -
+        // S3.1d's unmount path called `invalidate_unparked`, and the hand-over SUCCEEDED anyway.
+        // That is why every swap in the owner's log says `saved 0 B`, why the parking budget was
+        // never consulted for the case that mattered, and why the resumed slot decoded against a
+        // foreign session and ended early in silence.
+        //
+        // The fix is to publish the running request's own branch before asking for a hand-over, so
+        // the save has something to take and the budget question becomes the real question.
+        // `ReqCtx::consumed` IS that list: `finish_prefill` seeds it with the prompt ids [0, n-1) and
+        // every committed window token joins it - exactly what `finish_request` later swaps into
+        // `live`.  COPY it, never swap it: the decode loop keeps appending and `finish_request` still
+        // owns it.
+        //
+        // These two live at SERVE scope on purpose: inside the driver block the name `live` is the
+        // driver's own `std::deque<ReqCtx>`, and a helper defined there would silently write the
+        // wrong container.  `own_imgs` rather than the serve-scope `req_imgs` for the same reason -
+        // `req_imgs` names whichever request was prepped LAST, and attaching another conversation's
+        // picture keys to this token list would corrupt the cache's prefix comparison.
+        auto publish_decode_branch = [&](ReqCtx& R) {
+            if (R.phase != strata::program::serve_driver::Phase::decode) return;
+            if (R.consumed.empty()) return;   // nothing read yet: nothing to publish
+            live = R.consumed;
+            live_imgs = imgs_below(R.own_imgs, (int64_t) live.size());
+            live_ok = o.prompt_cache > 0;
+            sync_conversation();              // the slot's mirror must match what we are about to save
+        };
+        // S3.8 — THE SAME PUBLISH FOR A MID-PROMPT READ, and this one is what makes two concurrent
+        // prefills finish at all.
+        //
+        // THE LIVELOCK.  A slot in `prefill` had no publish at all, so `live_ok` was still false and
+        // `park_current` refused its save at any budget: every swap out reported `saved 0 B`,
+        // `invalidate_unparked` cleared the branch, and the next step sent the request back to token 0.
+        // The owner's log has slot 3 `reset to token 0: 81 prompt tokens will be read again` 101 times
+        // while slot 2 parked and resumed normally - two prefills erasing each other's progress, so
+        // neither ever finished.  `outgoing_for` used to call that slot `re_readable`, which licenses
+        // exactly this: re-reading is survivable ONCE, and on every swap it is a spin.
+        //
+        // What the session actually holds for such a slot is the prompt read so far: `run_prefill_step`
+        // reads [at, to) and stops at `n - 1`, because the last prompt token always starts the first
+        // verify window.  So the resumable branch is `ids[0, at)` - which is precisely what
+        // `finish_request` would swap in at the end of the read (`consumed` = ids[0, n-1)).
+        //
+        // `checks` is deliberately NOT touched.  The adopt hook maintains the invariant that serve-scope
+        // `checks` belongs to the mounted slot (a restoring hand-over loads the image's chain, a
+        // non-restoring one clears it, `prep_request` rebuilds it), and every checkpoint of this read was
+        // taken at a position <= `at`, so they are all prefixes of the branch being published here.
+        auto publish_prefill_branch = [&](ReqCtx& R) {
+            if (R.phase != strata::program::serve_driver::Phase::prefill &&
+                R.phase != strata::program::serve_driver::Phase::prefill_end) return;
+            if (R.at <= 0) return;   // nothing read yet: the prompt is entirely in hand, re-read is cheap
+            // A cancelled or failed read leaves the session somewhere BETWEEN two chunks, so its
+            // running state is ahead of `at` and there is nothing clean to continue from - the same
+            // reason `finish_request` guards `live.swap(consumed)` with `if (!cancelled)`.  Such a
+            // request is unwinding anyway; it will be finished on a later step, and a hand-over away
+            // from it is refused as `not_saveable` (which the incoming slot waits out) rather than
+            // parking a branch the session does not describe.
+            if (R.cancelled) return;
+            // `R.at` is a segment end, and every segment end is at most `n - 1`, so this stays inside
+            // the prompt.  The cast is 0.1.30's own (`finish_prefill` seeds `consumed` the same way).
+            const int64_t upto = std::min<int64_t>(R.at, (int64_t) R.ids.size());
+            live.assign(R.ids.begin(), R.ids.begin() + (size_t) upto);
+            live_imgs = imgs_below(R.own_imgs, (int64_t) live.size());
+            live_ok = o.prompt_cache > 0;
+            sync_conversation();
+        };
+        // Publish whichever branch the mounted slot owes the cache.  One call site, so a hand-over can
+        // never see a running slot with nothing to save - which is what made every pre-emption of a
+        // prefill both un-parkable and (wrongly) allowed.
+        auto publish_working_branch = [&](ReqCtx& R) {
+            publish_decode_branch(R);
+            publish_prefill_branch(R);
+        };
+        // On the way back in, `consumed` must name the sequence the restored session holds.  Without
+        // this pair a resumed decode would count sampling penalties over the wrong tokens and
+        // `finish_request` would park the wrong branch - a wrong-but-plausible answer, which is the
+        // class of bug this whole file exists to prevent.
+        auto restore_published_branch = [&](ReqCtx& R) {
+            if (R.phase == strata::program::serve_driver::Phase::decode) {
+                if (!live_ok || live.empty()) return;
+                R.consumed.assign(live.begin(), live.end());
+                return;
+            }
+            // S3.8: the prefill half of the pair.  A restored session holds `ids[0, at)` of this
+            // request, so the read must continue from there and NOT from wherever the cursor was
+            // left.  `seek_mount_index` mounts the EXACT branch, so `live.size() == R.at` by
+            // construction; re-deriving it here is what makes that an invariant of the code rather
+            // than an accident of the lookup, and re-planning the segments keeps `seg_i` in step with
+            // the cursor (`run_prefill_step` skips any segment end at or below `at`).
+            if (R.phase != strata::program::serve_driver::Phase::prefill &&
+                R.phase != strata::program::serve_driver::Phase::prefill_end) return;
+            if (!live_ok || live.empty()) return;
+            R.at = (int64_t) live.size();
+            R.seg_i = 0;
+            while (R.seg_i < R.seg.size() && R.seg[R.seg_i] <= R.at) ++R.seg_i;
+            // `pp_next_check` is NOT re-derived: it travels with the request (`arm_prompt_state` puts
+            // the serve-scope copy back from `R.pp_next_check` and the step copies it out again), so
+            // the mid-prompt checkpoint schedule keeps its original positions across a swap.
+            // No log line here either: `do_swap` already prints `slot N resumed from T tokens`, and
+            // for a prefill `T` IS this cursor.
+        };
+        // ---- phases 1 + 2: parse the line, resolve the resume point, mount, dispatch sampling.
+        // `Prep::rejected` means the request was refused and its ERR line is already printed - the
+        // old `continue` sites, in the same places.
+        auto prep_request = [&](ReqCtx& R, const std::string& line) -> Prep {
+
+            // ---- S3.1c: the request line, parsed by the one parser that knows both wire forms ----------
+            const strata::program::serve_proto::Defaults proto_def{o.pcie_frac, o.spec_min_p};
+            R.rq = strata::program::serve_proto::parse_request(line, proto_def, tagged);
+            const strata::program::serve_proto::Request& rq = R.rq;
+
+            if (rq.kind == strata::program::serve_proto::Kind::stop) {
+                // A STOP that reached the queue rather than the stdin thread: only possible for a malformed
+                // `STOP <junk>`, which 0.1.30 had no word for at all.
+                std::printf("%s\n", sp_err(rq.error).c_str());
+                return Prep::rejected;
+            }
+            if (rq.kind != strata::program::serve_proto::Kind::gen &&
+                rq.kind != strata::program::serve_proto::Kind::geni) {
+                std::printf("%s\n", sp_out.err(strata::program::serve_proto::err_expected()).c_str());
+                return Prep::rejected;
+            }
+            if (!rq.error.empty()) {
+                std::printf("%s\n", sp_out.err(rq.error).c_str());
+                return Prep::rejected;
+            }
+            R.geni = rq.kind == strata::program::serve_proto::Kind::geni;
+            const bool& geni = R.geni;
+            R.max_new = (long long) rq.max_new;
+            const long long& max_new = R.max_new;
             // optional sampling keys between max_new and the ids: temperature=F, top_p=F, top_k=N, min_p=F,
             // penalty_last_n=N, penalty_repeat=F, penalty_freq=F, penalty_present=F, seed=N (text requests
             // only).  Absent keys keep today's behavior: greedy, no penalties.
-            float req_temperature = 0.0f, req_top_p = 1.0f;
-            int req_top_k = 20;   // the sampler's own default; the sampled path REQUIRES top_k in 1..64
-            unsigned long long req_seed = 0;
-            float req_min_p = 0.0f, req_penalty_repeat = 1.0f, req_penalty_freq = 0.0f, req_penalty_present = 0.0f;
-            int req_penalty_last_n = 0;
-            int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
+            R.req_temperature = rq.temperature;
+            const float& req_temperature = R.req_temperature;
+            R.req_top_p = rq.top_p;
+            const float& req_top_p = R.req_top_p;
+            R.req_top_k = rq.top_k;
+            const int& req_top_k = R.req_top_k;   // the sampler's own default; the sampled path REQUIRES top_k in 1..64
+            R.req_seed = rq.seed;
+            const unsigned long long& req_seed = R.req_seed;
+            R.req_min_p = rq.min_p; R.req_penalty_repeat = rq.penalty_repeat;
+            const float& req_min_p = R.req_min_p; const float& req_penalty_repeat = R.req_penalty_repeat;
+            R.req_penalty_freq = rq.penalty_freq; R.req_penalty_present = rq.penalty_present;
+            const float& req_penalty_freq = R.req_penalty_freq; const float& req_penalty_present = R.req_penalty_present;
+            R.req_penalty_last_n = rq.penalty_last_n;
+            const int& req_penalty_last_n = R.req_penalty_last_n;
+            R.req_cvec = rq.cvec;
+            const int& req_cvec = R.req_cvec;   // cvec=0|1: a loaded control vector for this request (on when absent)
             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
-            double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
-            if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
-                                     // embedding file path is the first token without an =
-                for (;;) {
-                    while (*endp == ' ') ++endp;
-                    const char* start = endp;
-                    while (*endp != '\0' && *endp != ' ') ++endp;
-                    if (endp == start) break;
-                    const std::string tok(start, (size_t) (endp - start));
-                    const size_t eq = tok.find('=');
-                    if (eq == std::string::npos) { endp = const_cast<char*>(start); break; }
-                    const std::string key = tok.substr(0, eq);
-                    const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
-                    if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
-                    else if (key == "temperature") req_temperature = fv;
-                    else if (key == "top_p") req_top_p = fv;
-                    else if (key == "top_k") req_top_k = std::atoi(tok.c_str() + eq + 1);
-                    else if (key == "min_p") req_min_p = fv;
-                    else if (key == "penalty_last_n") req_penalty_last_n = std::atoi(tok.c_str() + eq + 1);
-                    else if (key == "penalty_repeat") req_penalty_repeat = fv;
-                    else if (key == "penalty_freq") req_penalty_freq = fv;
-                    else if (key == "penalty_present") req_penalty_present = fv;
-                    else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
-                    else if (key == "pcie_frac") req_pcie_frac = std::clamp((double) fv, 0.0, 1.0);
-                    else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
-                    // unknown keys are skipped: the ids start at the first token without '='
+            R.req_pcie_frac = rq.pcie_frac; R.req_spec_min_p = rq.spec_min_p;
+            const double& req_pcie_frac = R.req_pcie_frac;
+            R.emb_path = rq.emb_path;
+            const std::string& emb_path = R.emb_path;
+            R.ids = rq.ids;
+            std::vector<int64_t>& ids = R.ids;
+            // ---- S3.1b: the request's registry row.  With --serve-slots 0/1 there is none: the serial path
+            // is 0.1.30's path, and inventing a row for it would change nothing except the risk.
+            req_id = rq.id;
+            R.id = rq.id;
+            bool& slot_open = R.slot_open;
+            if (tagged) {
+                if (req_id == strata::program::serve_proto::kNoId) {
+                    // A tagged session needs an id to route its answer by.  An old client against a
+                    // --serve-slots >= 2 engine is the one pair the compatibility matrix does NOT support
+                    // (§6.4: the server enables multi-slot only when it sees slots=), so say so plainly
+                    // instead of guessing an id and mis-routing the answer.
+                    std::printf("%s\n", sp_out.err("this engine was started with --serve-slots " +
+                                                   std::to_string(slots) + ": requests need a request id "
+                                                   "(GEN <id> <max_new> ...)").c_str());
+                    return Prep::rejected;
                 }
+                std::string serr;
+                {
+                    std::lock_guard<std::mutex> lk(slot_mu);
+                    const int64_t now_ms = (int64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
+                        Clock::now().time_since_epoch()).count();
+                    strata::program::slot::Slot* s = slots_reg.add(req_id, now_ms);
+                    if (s == nullptr) serr = "no slot free for request id";
+                    else {
+                        s->req = rq;
+                        s->ctx_cap = o.max_context;
+                        s->prompt_tokens = (int64_t) ids.size();
+                        s->ctx_used = (int64_t) ids.size();
+                        // A `STOP <id>` that arrived before this line did (serve/server.py can send both back
+                        // to back): apply it now, so the request is cancelled rather than run.
+                        for (size_t k = 0; k < pending_cancel.size(); ++k)
+                            if (pending_cancel[k] == req_id) {
+                                pending_cancel.erase(pending_cancel.begin() + (std::ptrdiff_t) k);
+                                slots_reg.cancel_request(req_id);
+                                break;
+                            }
+                    }
+                    running_id.store(req_id);
+                }
+            if (!serr.empty()) { std::printf("%s\n", sp_err(serr).c_str()); return Prep::rejected; }
+                emit_slot(req_id);
+                slot_open = true;
             }
-            std::string emb_path;
-            if (geni && endp != nullptr) {
-                while (*endp == ' ') ++endp;
-                char* gap = std::strchr(endp, ' ');
-                if (gap != nullptr) { emb_path.assign(endp, (size_t) (gap - endp)); endp = gap; }
-            }
-            std::vector<int64_t> ids;
-            std::string pe;
-            if (max_new < 1 || endp == nullptr || (geni && emb_path.empty()) || !parse_i64_list(endp, ids, pe)) {
-                std::printf("ERR bad request: %s\n", pe.empty() ? "max_new" : pe.c_str());
-                continue;
-            }
-            const int64_t n = (int64_t) ids.size();
+            R.n = (int64_t) ids.size();
+            const int64_t n = R.n;
+            // S3.1d R7: copy the mounted slot's position table out BEFORE this request may overwrite
+            // it.  One table, one owner - the save has to come first or the outgoing slot loses it.
+            if (swaps_on) sync_positions();
             req_imgs.clear();
-            if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
+            if (geni && !o.vision) {
+                std::printf("%s\n", sp_err("this engine was started without --vision").c_str());
+                return Prep::rejected;
+            }
             if (geni || !mrope_identity) {
+                R.mrope_touched = true;
                 // positions for every cell this request can reach; the identity again for a text request
                 std::string ve;
                 row_ptr.assign((size_t) n, nullptr);
@@ -4264,44 +6485,49 @@ int main(int argc, char** argv) {
                 cudaDeviceSynchronize();
                 tr("device idle");
                 // CUDA0's table and, with a layer split, every later stage's (each device reads its own)
-                auto upload_mrope = [&]() -> bool {
-                    bool ok = cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t),
-                                         cudaMemcpyHostToDevice) == cudaSuccess;
-                    for (auto& st : stages) {
-                        const strata::core::OnDevice on(st->dev);
-                        cudaDeviceSynchronize();
-                        ok = ok && cudaMemcpy(st->mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t),
-                                              cudaMemcpyHostToDevice) == cudaSuccess;
-                    }
-                    return ok;
-                };
+                auto upload_mrope = [&]() -> bool { return upload_mrope_table(); };
                 if (ve.empty() && !upload_mrope()) ve = "the image position upload failed";
                 if (!ve.empty()) {
                     // leave the table as the identity so the next text request is untouched
                     for (int64_t c = 0; c < cells; ++c) put(c, c, c, c);
                     upload_mrope();
                     mrope_identity = true;
-                    std::printf("ERR %s\n", ve.c_str());
+                    std::printf("%s\n", sp_err(ve).c_str());
                     std::fflush(stdout);
-                    continue;
+                    return Prep::rejected;
                 }
                 mrope_identity = !geni;
             }
+            // S3.1d R7: the table in the host AND in the device now describes THIS request, and this
+            // request's slot is the one about to be mounted.  Record that - both who owns the one
+            // table and a copy of it in the slot's record, so a later hand-over that does NOT come
+            // from a request line (S3.1e pre-empting a decode) can put it back.  This runs whether or
+            // not the block above executed: when it did not, the table is still the identity and the
+            // device still matches it, so the record must say "identity" too.
+            if (swaps_on) {
+                mrope_owner = req_id;
+                strata::program::serve_swap::SlotConv& c = conv_of(req_id);
+                c.mrope_image = !mrope_identity;
+                c.mrope = mrope_identity ? std::vector<int32_t>{} : mrope_host;
+            }
             sp.embd_rows = geni ? row_ptr.data() : nullptr;
             if (n + max_new + 8 > o.max_context) {
-                std::printf("ERR prompt (%lld tokens) + max_new (%lld) exceeds the context (%lld)\n", (long long) n,
-                            (long long) max_new, (long long) o.max_context);
-                continue;
+                std::printf("%s\n", sp_err("prompt (" + std::to_string(n) + " tokens) + max_new (" +
+                                           std::to_string(max_new) + ") exceeds the context (" +
+                                           std::to_string(o.max_context) + ")").c_str());
+                return Prep::rejected;
             }
             bool bad = false;
             for (int64_t t : ids) bad = bad || t < 0 || t >= n_vocab;
-            if (bad) { std::printf("ERR a token id is outside the vocabulary\n"); continue; }
-            std::array<int64_t, 3> remote_before{};
-            std::array<int64_t, 3> launches_before{};
-            std::array<uint64_t, 3> compact_before{}, full_before{};
+            if (bad) { std::printf("%s\n", sp_err("a token id is outside the vocabulary").c_str()); return Prep::rejected; }
+            std::array<int64_t, 3>& remote_before = R.remote_before;
+            std::array<int64_t, 3>& launches_before = R.launches_before;
+            std::array<uint64_t, 3>& compact_before = R.compact_before;
+            std::array<uint64_t, 3>& full_before = R.full_before;
             // ms_begin/ms_wait are cumulative since boot; the log line used to print them next to per-request deltas,
             // so the host time read as if it belonged to this request.  Take deltas here like every other column.
-            std::array<double, 3> begin_before{}, wait_before{};
+            std::array<double, 3>& begin_before = R.begin_before;
+            std::array<double, 3>& wait_before = R.wait_before;
             for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
             {
                 remote_before[(size_t) r] = remote_experts[(size_t) r].computed();
@@ -4312,7 +6538,99 @@ int main(int argc, char** argv) {
                 wait_before[(size_t) r] = remote_experts[(size_t) r].ms_wait();
             }
             cur = ids;
-            const Clock::time_point r0 = Clock::now();
+            // ---- S3.1d: the hand-over, when this request belongs to a DIFFERENT slot ----------------
+            //
+            // This is the whole of S3.1d's call site, and it is deliberately the ONLY new thing a
+            // request can hit: with --serve-slots 0/1 or STRATA_NO_SWAP=1 it never runs, and the
+            // park/mount sequence below is 0.1.30's verbatim (§7.1's bit-exactness bar).
+            //
+            // It runs BEFORE the resume search and before `r0`, because everything after it reads
+            // `live`/`checks`/`cvec_cached`, and those must already be the incoming slot's.  The swap's
+            // own time is not charged to this request's `prompt_ms`; it is reported on its own stderr
+            // line and counted in `slots_reg.note_swap()` so /metrics can price OQ3.
+            parked_by_swap = false;
+            mounted_by_swap = false;
+            if (swaps_on) prune_conv();
+            if (swaps_on && strata::program::serve_swap::swap_needed(mounted_id, req_id)) {
+                sync_conversation();   // the outgoing slot's mirror must describe the session we are about to save
+                const bool want_cvec_now = strata::kernels::cvec().loaded() ? req_cvec != 0 : true;
+                // Take this request's parked image out of the cache FIRST: the outgoing save then
+                // counts it as `held` RAM, exactly as 0.1.30's `park_current(incoming->bytes())` does.
+                // S3.9: `req_id` is the requester, so an entry CLAIMED by another running slot is not
+                // offered.  This lookup matches on any checkpoint prefix, and the mount that follows
+                // takes the WHOLE entry - which is how a 9 849-token prefix reuse destroyed another
+                // slot's 10 394-token branch and got that slot ended.
+                const auto pre = conversations.best(ids, req_imgs, want_cvec_now,
+                                                    swaps_on ? req_id : strata::core::kNoOwner);
+                if (pre.tokens > 0) mount_image.emplace(conversations.take(pre.index));
+                bool poisoned = false;
+                std::string serr;
+                bool swapped = swap_to(req_id, serr, poisoned, /*restore_positions=*/false);
+                if (swapped) {
+                    // The hand-over already dealt with the outgoing branch - it saved it, or it
+                    // refused to and invalidated it.  Either way the session now holds the INCOMING
+                    // conversation, so the request body must not park: that would snapshot the branch
+                    // it has just mounted, a gigabyte of memcpy and a duplicate cache entry.
+                    parked_by_swap = true;
+                }
+                if (!swapped && poisoned) {
+                    // A restore that failed mid-write: fatal to the session, exactly as today.
+                    std::printf("%s\n", sp_out.err("restoring parked conversation: " + serr, req_id).c_str());
+                    std::fflush(stdout);
+                    return Prep::fatal;
+                }
+                if (!swapped && swap_wrote_session) {
+                    // The restore happened and something after it failed (or the restore itself
+                    // failed).  The request cannot run against a half-established slot, and it must
+                    // not retry: a second hand-over would save THIS branch out as the outgoing one.
+                    return_mount_image();
+                    std::printf("%s\n", sp_out.err("slot hand-over failed after the restore: " + serr, req_id).c_str());
+                    std::fflush(stdout);
+                    slot_step(req_id, strata::program::slot::State::error);
+                    return Prep::rejected;
+                }
+                if (!swapped && swap_park_refused) {
+                    // S3.6: the slot the session reflects still has work to do and its state cannot be
+                    // saved, so the session stays with it and the retry-without-a-restore below must
+                    // NOT run - that retry is what used to destroy a running conversation.
+                    //
+                    // The INCOMING request is answered, not starved and not spun on: an ERR naming
+                    // both numbers, its row closed, its permit back.  A request line is a one-shot
+                    // hand-over - the client asked for this conversation now - so unlike the driver's
+                    // `do_swap` there is nothing to defer it behind.
+                    return_mount_image();
+                    std::fprintf(stderr, "strata serve: swap to slot %lld refused at the request line (%s) - "
+                                         "that request is ended, the mounted slot keeps the session\n",
+                                 (long long) req_id, serr.c_str());
+                    std::printf("%s\n", sp_out.err(serr, req_id).c_str());
+                    std::fflush(stdout);
+                    slot_step(req_id, strata::program::slot::State::error);
+                    return Prep::rejected;
+                }
+                if (!swapped) {
+                    // The image was rejected (or the save refused) BEFORE anything was written.  The
+                    // outgoing branch is intact and still mounted; drop the image and hand over
+                    // without a restore, which is the same answer 0.1.30 gives for an invalid
+                    // snapshot: fall back to re-reading.
+                    std::fprintf(stderr, "strata serve: swap: slot %lld -> %lld retried without a restore (%s)\n",
+                                 (long long) mounted_id, (long long) req_id, serr.c_str());
+                    return_mount_image();
+                    poisoned = false;
+                    serr.clear();
+                    if (!swap_to(req_id, serr, poisoned, /*restore_positions=*/false)) {
+                        std::printf("%s\n", sp_out.err("slot hand-over failed: " + serr, req_id).c_str());
+                        std::fflush(stdout);
+                        if (poisoned) return Prep::fatal;
+                        slot_step(req_id, strata::program::slot::State::error);
+                        return Prep::rejected;
+                    }
+                }
+            }
+            R.r0 = Clock::now();
+            const Clock::time_point& r0 = R.r0;
+            // S0.3: the request's loan bill is a delta over these (STRATA_PREFILL_LOAN_TIMING)
+            R.loan_bill = loan_totals(pf_parts);
+            R.res_uploads0 = res_dirty.uploads(); R.res_skips0 = res_dirty.skipped();
             // ---- where this request starts reading: the live session, or a checkpoint, whose tokens AND pictures are
             // exactly the start of this prompt - at most n - 1 of them, the last token is always the first window
             auto starts_with = [&](const std::vector<int32_t>& pre, const std::vector<ImgKey>& pre_imgs) -> bool {
@@ -4322,9 +6640,10 @@ int main(int argc, char** argv) {
                     if ((int32_t) ids[(size_t) i] != pre[(size_t) i]) return false;
                 return imgs_below(req_imgs, L) == pre_imgs;
             };
-            const bool want_cvec = strata::kernels::cvec().loaded() ? req_cvec != 0 : true;
-            int64_t resume = 0;
-            bool from_live = false;
+            R.want_cvec = strata::kernels::cvec().loaded() ? req_cvec != 0 : true;
+            const bool& want_cvec = R.want_cvec;
+            int64_t& resume = R.resume;
+            bool& from_live = R.from_live;
             if (o.prompt_cache > 0 && want_cvec == cvec_cached) {
                 if (live_ok && starts_with(live, live_imgs)) { resume = (int64_t) live.size(); from_live = true; }
                 for (const ConvCheckpoint& c : checks)
@@ -4333,37 +6652,59 @@ int main(int argc, char** argv) {
                         from_live = false;
                     }
             }
-            const auto parked = conversations.best(ids, req_imgs, want_cvec);
+            // S3.1d: the swap already restored this slot's image, so the session IS its longest
+            // prefix; searching the cache again would mount a second image over it.
+            // S3.9: and the same claim rule as the request-line lookup - this is the other prefix
+            // `take()`, and it can destroy a different slot's parked branch just as easily.
+            const auto parked = mounted_by_swap
+                                    ? strata::core::ConversationCache::Match{}
+                                    : conversations.best(ids, req_imgs, want_cvec,
+                                                         swaps_on ? req_id : strata::core::kNoOwner);
             std::optional<strata::core::SavedConversation> incoming;
             if (parked.tokens > resume) incoming.emplace(conversations.take(parked.index));
             // Reject the entire image before parking/overwriting the outgoing
             // state. Invalid entries can safely fall back to its existing prefix.
-            if (incoming && !strata::core::conversation_snapshot_validate(*incoming, ss, g, mtp.kv_state(), err)) {
+            if (incoming && !strata::core::conversation_snapshot_validate(*incoming, ss, conv_stages, g, mtp.kv_state(), err)) {
                 std::fprintf(stderr, "strata serve: conversation cache: discard invalid snapshot (%s)\n", err.c_str());
                 incoming.reset();
                 err.clear();
             }
             // Preserve the outgoing branch before any checkpoint rewind, reset,
             // or incoming restore overwrites the positional state it requires.
-            if ((!from_live || incoming) && !park_current(incoming ? incoming->bytes() : 0)) {
-                std::printf("ERR %s\n", err.c_str());
-                return 1;
+            // S0.3 lever 4: a request that mounts a parked conversation or starts one from zero is exactly
+            // where parking pays, so it asks even inside a quiet window.  It does NOT clear the refusal
+            // streak: on this box roughly one request in thirteen starts a new conversation, and clearing on
+            // those would mean the backoff never engages at all.
+            const bool park_forced = incoming != std::nullopt || resume == 0;
+            // S3.1d: after a hand-over the outgoing branch was already saved by the swap, so the
+            // request body must not park it a second time (that would duplicate the image the swap has
+            // just restored).  Only a snapshot FAILURE is fatal here, exactly as in 0.1.30.
+            const bool need_park = (!from_live || incoming) && !parked_by_swap;
+            // S3.9: what is parked here is the branch the SESSION holds, which belongs to the slot
+            // still mounted - not to the request being prepped.  Claiming it for `req_id` would be
+            // worse than not claiming it: it would hide another slot's conversation behind this one's
+            // id, and release it when this request finished.
+            if (need_park && park_current(incoming ? incoming->bytes() : 0, park_forced,
+                                          park_owner_for(mounted_id)) ==
+                            strata::program::serve_swap::Saved::failed) {
+                std::printf("%s\n", sp_out.err(err, R.id).c_str());
+                return Prep::fatal;
             }
             if (incoming) {
                 const auto t0 = Clock::now();
-                if (strata::core::conversation_snapshot_restore(*incoming, ss, g, mtp.kv_state(), err) !=
+                if (strata::core::conversation_snapshot_restore(*incoming, ss, conv_stages, g, mtp.kv_state(), err) !=
                     strata::core::ConversationRestore::restored) {
                     // Already prevalidated above: a failure here is fatal, never
                     // permission to decode from a partially restored session.
-                    std::printf("ERR restoring parked conversation: %s\n", err.c_str());
-                    return 1;
+                    std::printf("%s\n", sp_out.err("restoring parked conversation: " + err, R.id).c_str());
+                    return Prep::fatal;
                 }
                 if (std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr) {
                     uint64_t draft_hash = 0;
                     if (!strata::core::conversation_kv_verify(incoming->kv.back(), mtp.kv_state(), g,
                             int64_t(incoming->live.ids.size()), false, draft_hash, err)) {
-                        std::printf("ERR verifying restored draft KV: %s\n", err.c_str());
-                        return 1;
+                        std::printf("%s\n", sp_out.err("verifying restored draft KV: " + err, R.id).c_str());
+                        return Prep::fatal;
                     }
                     std::fprintf(stderr, "strata serve: SNAPSHOT_VERIFY draft=%016llx cells=%lld mode=%d source=%s resident=%lld\n",
                                  (unsigned long long) draft_hash, (long long) incoming->kv.back().cells,
@@ -4396,7 +6737,7 @@ int main(int argc, char** argv) {
                              return (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs);
                          }), checks.end());
             live_ok = false;   // until this request has finished, the session is in between
-            int64_t reread_to = -1;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
+            int64_t& reread_to = R.reread_to;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
             if (resume == 0) {
                 strata::core::session_zero(ss, g, nullptr, main_cs);
                 cudaStreamSynchronize(main_stream);
@@ -4435,8 +6776,8 @@ int main(int argc, char** argv) {
                                }
                                return false;
                            }()) {
-                    std::printf("ERR restoring a conversation checkpoint failed\n");
-                    return 1;
+                    std::printf("%s\n", sp_out.err("restoring a conversation checkpoint failed", R.id).c_str());
+                    return Prep::fatal;
                 }
             }
             // KV streaming: the drafter's ring may hold cells past `resume` from a longer turn; the main layers'
@@ -4444,7 +6785,9 @@ int main(int argc, char** argv) {
             if (resume > 0 && reread_to <= 0) mtp.kv_restore(resume);
             tr("request", n, geni ? 1 : 0);
             mtp.set_prompt_len(n);
-            const int64_t read_from = reread_to > 0 ? 0 : resume;
+            if (swaps_on) mtp_prompt_len = n;   // travels with the slot (serve_swap::SlotConv::prompt_len)
+            R.read_from = reread_to > 0 ? 0 : resume;
+            const int64_t& read_from = R.read_from;
             conversations.limit_reuse(read_from);
             pp_total = n;
             pp_from = read_from;
@@ -4455,133 +6798,14 @@ int main(int argc, char** argv) {
                 part_at.clear();
                 std::fill(part_next.begin(), part_next.end(), pp_next_check);
             }
-            std::printf("RESUME %lld\n", (long long) resume);   // before reading: this many prompt tokens are reused
+            std::printf("%s\n", sp_out.resume(resume, req_id).c_str());   // before reading: this many prompt tokens are reused
+            slot_step(req_id, strata::program::slot::State::prefilling);
             strata::core::progress_at("reading the prompt, from token", read_from);
             std::fflush(stdout);
-            // A SHORT PART OF THE PROMPT - the new message of a chat that continues from a checkpoint, the assistant
-            // header - goes through the verify windows, S tokens at a time, as decode reads them.  The batched path
-            // costs ~300 ms per run however few tokens it has (it streams every expert the chunk routes to that is
-            // not in VRAM over PCIe), and it borrows slots it must refill after (~180 ms); a window costs ~16 ms a
-            // token, with the misses on the CPU.  Each part below is decided on its own, so a long first message is
-            // read batched and its header still goes through the windows.  Picture rows need the batched path.
-            // STRATA_CKPT_REREAD compares a restored checkpoint with a batched re-read, so it keeps every read batched.
-            static const bool no_short = std::getenv("STRATA_CKPT_REREAD") != nullptr;
-            auto windows_ok = [&](int64_t a, int64_t b) -> bool {
-                if (no_short || b - a > o.short_read) return false;
-                if (sp.embd_rows != nullptr)
-                    for (int64_t i = a; i < b; ++i)
-                        if (sp.embd_rows[i] != nullptr) return false;
-                return true;
-            };
-            // tokens [a, b) through the windows: commit all of them, then give the draft layer their residuals
-            auto read_windows = [&](int64_t a, int64_t b, std::string& e) -> bool {
-                strata::core::progress_at("reading the prompt (verify windows), from token", a);   // #217: not "batched"
-                // every token is committed and the picks are discarded: no head sampling (see set_head_sampling)
-                struct NoHeadSampling {
-                    strata::core::Verifier& v;
-                    explicit NoHeadSampling(strata::core::Verifier& x) : v(x) { v.set_head_sampling(false); }
-                    ~NoHeadSampling() { v.set_head_sampling(true); }
-                } no_head_sampling(ver);
-                std::vector<int32_t> win((size_t) S), outw((size_t) S), nxt((size_t) S);
-                for (int64_t q = a; q < b;) {
-                    if (stop_req.load()) { e = "cancelled"; return false; }
-                    const int T = (int) std::min<int64_t>(S, b - q);
-                    for (int t = 0; t < T; ++t) {
-                        win[(size_t) t] = (int32_t) cur[(size_t) (q + t)];
-                        nxt[(size_t) t] = (int32_t) cur[(size_t) (q + t + 1)];
-                    }
-                    drive.d.layers = 0;
-                    drive.d.experts = 0;
-                    drive.d.failed = false;
-                    if (!ver.run(T, win.data(), q, win_pool_fn, win_pool_user, outw.data(), e) || drive.d.failed) {
-                        if (drive.d.failed && drive.d.fail) e = drive.d.fail;
-                        return false;
-                    }
-                    if (!ver.commit(T, e) || !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e)) return false;
-                    q += T;
-                }
-                const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
-                std::printf("PP %lld %lld %.0f %.1f\n", (long long) b, (long long) pp_total, ms,
-                            ms > 0.0 ? 1000.0 * (double) (b - pp_from) / ms : 0.0);
-                strata::core::progress_beat();
-                std::fflush(stdout);
-                return true;
-            };
-            // the batched path's slots are lent just before its first run and given back (refilled) before a window
-            // reads - so the windows always see the whole expert cache - or once the prompt is read
-            // Every participant gives its loan back here: the rows it lent are refilled into the SAME slots from
-            // the arena, the residency table is restored, and one upload puts it on every device.  A stage refills
-            // through its own cache and its own device - a slot refilled into the wrong cache would leave that
-            // stage's cache holding an expert it does not own, which is silent and produces plausible tokens.
-            auto refill_one = [&](PfPart& p, std::string& e) -> bool {
-                if (p.lent.empty()) return true;
-                tr("refill start", (long long) p.lent.size());
-                const strata::core::OnDevice on(p.dev);
-                for (const auto& [i, slot] : p.lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
-                    const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
-                    const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
-                    if (b == nullptr || !(refill_blocking() ? p.cache->fill_slot_blocking(slot, b, e, nb)
-                                                            : p.cache->fill_slot_queued(slot, b, e, nb)))
-                        return false;
-                    host_res[(size_t) i] = slot;
-                }
-                if (!p.cache->sync_queued(e)) return false;
-                p.lent.clear();
-                p.lent_chunk = 0;
-                return true;
-            };
-            auto refill = [&](std::string& e) -> bool {
-                bool any = false;
-                for (PfPart& p : pf_parts)
-                    if (!p.lent.empty()) { any = true; if (!refill_one(p, e)) return false; }
-                if (any) res_upload();
-                return true;
-            };
-            // lend the slots `tokens` batched prompt tokens need: the prompt path's buffers for min(chunk, tokens
-            // rounded up to 256), laid out in the last of the slots it may borrow - per participant, out of that
-            // participant's own cache, and marking only that participant's own layers
-            auto lend = [&](int64_t tokens, std::string& e) -> bool {
-                if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
-                // what this segment needs, capped by the configured chunk: a request lends only what its own
-                // prompt needs, so a large chunk costs a short prompt nothing
-                const int64_t want = request_chunk(tokens, o.prefill_chunk);
-                if (want <= 0) {
-                    e = "prefill: cannot lend buffers for an empty request segment";
-                    return false;
-                }
-                bool any = false;
-                for (PfPart& p : pf_parts) {
-                    if (p.first < 0) continue;
-                    if (!p.lent.empty()) {
-                        if (want <= p.lent_chunk) continue;            // its current loan already covers this
-                        // ONLY this participant's loan goes back: `refill` would return the other participants'
-                        // loans too, and their buffers are still laid out in their caches - marking those slots
-                        // resident again would hand the next window a prompt buffer in place of an expert
-                        if (!refill_one(p, e)) return false;
-                    }
-                    const strata::core::OnDevice on(p.dev);
-                    const int32_t first = std::max<int32_t>(p.first, (int32_t) (p.cache->slots() - part_slots(p, want)));
-                    if (want != p.sp->chunk() || first != p.first_now) {
-                        if (!p.sp->relayout(want, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
-                        p.first_now = first;
-                    }
-                    for (int64_t l = p.lb; l < p.le; ++l)              // THIS participant's layers only
-                        for (int64_t ex = 0; ex < g.n_expert; ++ex) {
-                            const size_t i = (size_t) (l * g.n_expert + ex);
-                            if (host_res[i] >= first) {
-                                p.lent.emplace_back((int32_t) i, host_res[i]);
-                                host_res[i] = strata::core::kNotResident;
-                                any = true;
-                            }
-                        }
-                    p.lent_chunk = want;
-                }
-                if (any) res_upload();
-                return true;
-            };
+            apply_pending(true);
             apply_pending(true);
             // per-request sampling for the verify window's head (greedy when temperature is absent)
-            strata::kernels::SamplerParams req_sp;
+            strata::kernels::SamplerParams& req_sp = R.req_sp;
             req_sp.greedy = req_temperature <= 0.0f;
             req_sp.temperature = req_temperature;
             req_sp.top_p = req_top_p;
@@ -4601,15 +6825,44 @@ int main(int argc, char** argv) {
             for (int st = 0; st < split_drive.n; ++st)
                 split_drive.pcie_num[st] = (st == 0 || split_same || req_pcie_frac != o.pcie_frac)
                                                ? drive.d.pcie_num : pcie_num_of(stages[(size_t) st - 1]->pcie_frac);
-            const int hist_n = std::min(req_sp.penalty_last_n, kPenaltyWindowCap);
+            R.hist_n = std::min(req_sp.penalty_last_n, kPenaltyWindowCap);
+            const int& hist_n = R.hist_n;
             ver.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
-            bool cancelled = false;
+            // S3.1d: the same state, remembered for the slot, so a hand-over that is NOT driven by a
+            // request line (S3.1e pre-empting a decode) can put it back.  `smpl.counter` is not
+            // mirrored: the verifier derives the draw counter from the window position
+            // (verify.cpp:1087), which is per-slot sequence state, not sampler state.
+            // S3.6: from here to the next hand-over, the session describes THIS request - `prep_request`
+            // either restored its parked image, resumed one of its checkpoints, or zeroed the session
+            // and is about to read the whole prompt into it.
+            R.session_valid = true;
+            session_established = true;
+            R.own_imgs = req_imgs;
+            if (swaps_on) {
+                strata::program::serve_swap::SlotConv& c = conv_of(req_id);
+                c.smpl = req_sp;
+                c.smpl_set = true;
+                c.penalty_last_n = req_sp.penalty_last_n;
+                c.pcie_num = drive.d.pcie_num;
+            }
+            return Prep::ok;
+        };
+        // ---- phase 3 prologue: decide which prompt segments this request reads.
+        // S3.1e-1: split out of the straight-line body so S3.1e-2 can plan a request's reads when it
+        // admits it and then drive them one step at a time.  Same four segment ends, same order.
+        auto plan_prompt_segments = [&](ReqCtx& R) {
+            std::vector<int64_t>& ids = R.ids;
+            const int64_t n = R.n;
+            const int64_t& resume = R.resume;
+            const int64_t& read_from = R.read_from;
+            const int64_t& reread_to = R.reread_to;
+            int64_t& turn_at = R.turn_at;
+            int64_t& root_at = R.root_at;
             tr("prompt start", n - 1);
             // The prompt is read in two parts when it has a turn boundary past `resume`: up to the last <|im_start|>
             // (the conversation so far), a checkpoint there, then the new turn's header.  The next request of the same
             // chat renders the same history - but not always the same header or the thinking of this reply - so that
             // checkpoint is the one it reuses.
-            int64_t turn_at = -1;
             if (o.prompt_cache > 0 && o.turn_token >= 0)
                 for (int64_t i = n - 1; i > resume; --i)
                     if (ids[(size_t) i] == o.turn_token) { turn_at = i; break; }
@@ -4618,204 +6871,476 @@ int main(int argc, char** argv) {
             // which the retention policy pins (conv_cache.hpp), so the next new chat reads only what comes after it.
             // (PR #65, code-martin.)  Only for a system prompt of --prompt-cache-root tokens or more: a small one
             // is cheaper to read again than the extra part costs (~0.3 s).
-            int64_t root_at = -1;
             if (o.prompt_cache > 0 && o.turn_token >= 0 && o.prompt_cache_root > 0 && read_from == 0)
                 for (int64_t i = 1; i < turn_at; ++i)
                     if (ids[(size_t) i] == o.turn_token) {
                         if (i >= o.prompt_cache_root) root_at = i;
                         break;
                     }
-            int64_t at = read_from;
-            for (const int64_t to : {reread_to, root_at, turn_at, n - 1}) {
-                if (to <= at) continue;
-                err.clear();
-                const bool win = windows_ok(at, to);
-                if (win && !refill(err)) {
-                    std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
-                    return 1;
-                }
-                if (!win && !lend(to - at, err)) {
-                    std::printf("ERR lending the prompt path its slots failed: %s\n", err.c_str());
-                    return 1;
-                }
-                const auto tsp = Clock::now();
-                const bool sp_ok = win ? read_windows(at, to, err) : sp.run(ids.data() + at, to - at, at, err);
-                if (trace) {
-                    std::fprintf(stderr, "strata trace: read %lld tokens (%s) in %.1f ms\n", (long long) (to - at),
-                                 win ? "windows" : "batched",
-                                 std::chrono::duration<double, std::milli>(Clock::now() - tsp).count());
-                    std::fflush(stderr);
-                }
-                if (!sp_ok) {
-                    if (!stop_req.load()) {
-                        std::fprintf(stderr, "strata serve: %s\n", err.c_str());
-                        std::printf("ERR %s\n", err.c_str());
-                        // #224: a CUDA fault (an illegal address) poisons the context for the whole process, and
-                        // unwinding the destructors on it could hang until the 60 s watchdog: leave at once
-                        if (cudaPeekAtLastError() != cudaSuccess) {
-                            std::fflush(stdout);
-                            std::fflush(stderr);
-                            std::_Exit(1);
-                        }
-                        return 1;
-                    }
-                    cancelled = true;   // stopped while reading the prompt: refill the lent slots below, then DONE cancel
-                    break;
-                }
-                at = to;
-                if ((to == turn_at || to == root_at) && !checkpoint_at(to)) {
-                    std::printf("ERR saving a conversation checkpoint failed\n");
-                    return 1;
-                }
-            }
+            R.at = read_from;
+            R.seg = {reread_to, root_at, turn_at, n - 1};
+            R.seg_i = 0;
+        };
+        // ---- S3.6: send a request back to token 0, for real.
+        //
+        // `swap_to`'s unmount path has always promised that a slot which lost its parked image
+        // "will be re-read from token 0".  Nothing ever honoured it: the request's `ReqCtx` kept its
+        // phase, its cursor and its segment list, so the next step resumed exactly where it left off
+        // - against a session that now held somebody else's tokens.  This is the part that makes the
+        // promise true, and it is only ever reached for a request still in `prefill`/`prefill_end`
+        // (`serve_driver::step_gate` ends a `decode` request instead, because re-reading its prompt
+        // would emit the tokens it already sent).
+        //
+        // What has to change, and why each piece is load-bearing:
+        //   * the SESSION: zeroed, because its positional cells hold another conversation's tokens.
+        //     `prep_request` does exactly this when `resume == 0`; skipping it is the bug.
+        //   * the process-wide branch/chain (`live`, `live_imgs`, `checks`, `live_ok`): they describe
+        //     the conversation that was destroyed, and a checkpoint is only valid while the cells
+        //     below it hold its tokens.
+        //   * the request's own resume point: `resume = 0`, `read_from = 0`, `reread_to = -1`, so the
+        //     segments re-plan from the start and the mid-prompt checkpoint schedule restarts.
+        //   * `R.session_valid = true` at the end: the session is now THIS request's again, so the
+        //     gate lets it step.
+        auto reset_request_to_token0 = [&](ReqCtx& R) {
+            if (R.phase != strata::program::serve_driver::Phase::prefill &&
+                R.phase != strata::program::serve_driver::Phase::prefill_end) return;
+            // The loan must be back before the session is torn down: a snapshot or a zeroing taken
+            // while the prompt path holds cache slots describes a cache that does not exist (R8).
             if (!refill(err)) {
-                std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
-                return 1;
+                std::fprintf(stderr, "strata serve: slot %lld: returning its loan before re-reading failed "
+                                     "(%s)\n", (long long) R.id, err.c_str());
+                err.clear();
             }
-            tr("prompt done (slots refilled)");
-            const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
-            std::printf("REUSED %lld\n", (long long) resume);   // the prompt is read; the first window comes next
+            strata::program::serve_swap::SlotConv& c = conv_of(R.id);
+            const int64_t dropped = R.n;
+            const size_t dropped_checks = checks.size();
+            // 1. the session, from token 0.  Same calls `prep_request` makes on that path.
+            strata::core::session_zero(ss, g, nullptr, main_cs);
+            cudaStreamSynchronize(main_stream);
+            for (auto& st : stages) {
+                const strata::core::OnDevice on(st->dev);
+                strata::core::session_zero(st->ss, g, nullptr, (void*) st->stream);
+                cudaStreamSynchronize(st->stream);
+            }
+            // 2. the branch and the chain the destroyed conversation owned.
+            live.clear();
+            live_imgs.clear();
+            checks.clear();
+            live_ok = false;
+            cvec_cached = R.want_cvec;
+            if (strata::kernels::cvec().loaded()) strata::kernels::cvec_set_enabled(R.want_cvec);
+            // 3. the slot's own record: it no longer has an image, and its mirror is empty.
+            c.live.clear();
+            c.live_imgs.clear();
+            c.checks.clear();
+            c.live_ok = false;
+            c.resumable = false;      // nothing was parked; a later hand-over must not restore it
+            c.parked_index = -1;
+            c.parked_bytes = 0;
+            // 4. the request's resume point and its segment plan.
+            R.resume = 0;
+            R.from_live = false;
+            R.reread_to = -1;
+            R.read_from = 0;
+            R.turn_at = R.root_at = -1;
+            R.at = 0;
+            R.seg = {-1, -1, -1, R.n - 1};
+            R.seg_i = 0;
+            R.pp_total = R.n; R.pp_from = 0; R.pp_t0 = R.r0;
+            R.pp_next_check = R.resume + o.prompt_cache_every;
+            conversations.limit_reuse(0);
+            {
+                std::lock_guard<std::mutex> lk(part_mu);
+                part_at.clear();
+                std::fill(part_next.begin(), part_next.end(), R.pp_next_check);
+            }
+            // 5. the phase, back to the start of the read, and the session is ours again.  BOTH
+            // flags: `R.session_valid` is recomputed from `session_established` at the top of every
+            // step, so setting only the request's copy would be undone on the next pass.
+            R.phase = strata::program::serve_driver::Phase::prefill;
+            R.session_valid = true;
+            session_established = true;
+            // The prompt path's per-stage mid-prompt parts belong to the read that was just thrown
+            // away; the next checkpoint of this request must not splice onto them.  `arm_prompt_state`
+            // clears `part_at` when the prefilling request CHANGES, but a re-read is the same request,
+            // so it has to be cleared here explicitly.
+            {
+                std::lock_guard<std::mutex> lk(part_mu);
+                part_at.clear();
+            }
+            // The wire: this request now reuses nothing.  `RESUME` is printed once per request by
+            // `prep_request`, so the client is told again here rather than left with a stale number.
+            std::printf("%s\n", sp_out.resume(0, R.id).c_str());
+            std::fflush(stdout);
+            std::fprintf(stderr, "strata serve: slot %lld reset to token 0: %lld prompt tokens will be read "
+                                 "again (%zu checkpoints dropped)\n",
+                         (long long) R.id, (long long) dropped, dropped_checks);
+            std::fflush(stderr);
+        };
+        // ---- phase 3: read ONE prompt segment.  0.1.30 ran the four segments back to back in one
+        // `for`; the serial loop now calls this until it stops reporting `progressed`, which is the
+        // same lend / read / refill / checkpoint calls in the same order.  S3.1e-2 interleaves them.
+        auto run_prefill_step = [&](ReqCtx& R) -> Step {
+            std::vector<int64_t>& ids = R.ids;
+            const int64_t& turn_at = R.turn_at;
+            const int64_t& root_at = R.root_at;
+            int64_t& at = R.at;
+            bool& cancelled = R.cancelled;
+            // the next segment with something to read - 0.1.30's `if (to <= at) continue;`
+            int64_t to = -1;
+            bool have = false;
+            while (R.seg_i < R.seg.size()) {
+                const int64_t t = R.seg[R.seg_i++];
+                if (t > at) { to = t; have = true; break; }
+            }
+            if (!have) return Step::finished;
+            err.clear();
+            const bool win = windows_ok(at, to);
+            if (win && !refill(err)) {
+                std::printf("%s\n", sp_out.err("refilling a lent slot failed: " + err, R.id).c_str());
+                return Step::error;
+            }
+            if (!win && !lend(to - at, err)) {
+                std::printf("%s\n", sp_out.err("lending the prompt path its slots failed: " + err, R.id).c_str());
+                return Step::error;
+            }
+            const auto tsp = Clock::now();
+            const bool sp_ok = win ? read_windows(at, to, err) : sp.run(ids.data() + at, to - at, at, err);
+            if (trace) {
+                std::fprintf(stderr, "strata trace: read %lld tokens (%s) in %.1f ms\n", (long long) (to - at),
+                             win ? "windows" : "batched",
+                             std::chrono::duration<double, std::milli>(Clock::now() - tsp).count());
+                std::fflush(stderr);
+            }
+            if (!sp_ok) {
+                if (!stopped()) {
+                    std::fprintf(stderr, "strata serve: %s\n", err.c_str());
+                    std::printf("%s\n", sp_out.err(err, R.id).c_str());
+                    // #224: a CUDA fault (an illegal address) poisons the context for the whole process, and
+                    // unwinding the destructors on it could hang until the 60 s watchdog: leave at once
+                    if (cudaPeekAtLastError() != cudaSuccess) {
+                        std::fflush(stdout);
+                        std::fflush(stderr);
+                        return Step::fatal_exit;
+                    }
+                    return Step::error;
+                }
+                cancelled = true;   // stopped while reading the prompt: refill the lent slots below, then DONE cancel
+                return Step::cancelled;
+            }
+            at = to;
+            if ((to == turn_at || to == root_at) && !checkpoint_at(to)) {
+                std::printf("%s\n", sp_out.err("saving a conversation checkpoint failed", R.id).c_str());
+                return Step::error;
+            }
+            return Step::progressed;
+        };
+        // ---- phase 3 tail + phase 4 prologue: give the prompt loan back, report the prompt, and
+        // set the decode loop up.  Runs for a finished prompt AND for a cancelled one, exactly as
+        // 0.1.30's straight-line code did (its `break` fell through to here).
+        auto finish_prefill = [&](ReqCtx& R) -> Step {
+            std::vector<int64_t>& ids = R.ids;
+            const int64_t n = R.n;
+            const long long& max_new = R.max_new;
+            const Clock::time_point& r0 = R.r0;
+            const std::array<int64_t, 6>& loan_bill = R.loan_bill;
+            const int64_t& res_uploads0 = R.res_uploads0;
+            const int64_t& res_skips0 = R.res_skips0;
+            const int64_t& resume = R.resume;
+            bool& cancelled = R.cancelled;
+            const char*& finish = R.finish;
+            if (!refill(err)) {
+                std::printf("%s\n", sp_out.err("refilling a lent slot failed: " + err, R.id).c_str());
+                return Step::error;
+            }
+            tr(loan_policy.lazy ? "prompt done (loan returned lazily)" : "prompt done (slots refilled)");
+            // S0.3: the loan's bill for THIS request (the PfPart counters are cumulative over the process, so
+            // this reads the deltas taken when the request started).  The serve log has no lend/refill timer,
+            // which is why the fixed cost could only be inferred from the source; these lines make it
+            // measurable, and `bench/prefill/fixed-cost-changes.md` says which column each lever moves.
+            // S3.2b adds the two that matter for the floor: `rows out` is what this request took out and did
+            // NOT copy back, `pumped` is what the overlapped pump walked home, and `still out` is what the
+            // caches are missing right now - the number that says the refill was deferred rather than paid.
+            if (loan_timing() && !pf_parts.empty()) {
+                const std::array<int64_t, 6> now = loan_totals(pf_parts);
+                std::fprintf(stderr, "strata serve: loan request: relayout %lld, relayout skipped %lld, "
+                                     "loan grown %lld, rows refilled %lld, rows out %lld, pumped %lld, "
+                                     "still out %lld, res upload %lld (%lld skipped), loan return %s\n",
+                             (long long) (now[0] - loan_bill[0]), (long long) (now[1] - loan_bill[1]),
+                             (long long) (now[2] - loan_bill[2]), (long long) (now[3] - loan_bill[3]),
+                             (long long) (now[4] - loan_bill[4]), (long long) (now[5] - loan_bill[5]),
+                             (long long) loan_outstanding(pf_parts),
+                             (long long) (res_dirty.uploads() - res_uploads0),
+                             (long long) (res_dirty.skipped() - res_skips0),
+                             loan_policy.lazy ? "lazy" : "eager");
+            }
+            R.prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
+            std::printf("%s\n", sp_out.reused(resume, req_id).c_str());   // the prompt is read; the first window comes next
+            slot_step(req_id, strata::program::slot::State::decoding);
+            if (tagged) {
+                std::lock_guard<std::mutex> lk(slot_mu);
+                if (strata::program::slot::Slot* sl = slots_reg.find(req_id)) {
+                    sl->reused = resume;
+                    sl->ctx_used = n;
+                    slots_reg.set_active(req_id);      // §5.3: this slot is what the live session reflects
+                }
+            }
             std::fflush(stdout);
             // the verify windows: the first holds the last prompt token alone
-            int64_t p = n - 1;
-            int32_t x = (int32_t) ids[(size_t) (n - 1)];
-            std::vector<int32_t> drafts((size_t) S, 0), window((size_t) S), outv((size_t) S);
-            std::vector<float> dprob((size_t) S, 0.0f);
-            std::vector<int32_t> sbuf((size_t) S, 0);
+            R.p = n - 1;
+            R.x = (int32_t) ids[(size_t) (n - 1)];
+            R.drafts.assign((size_t) S, 0); R.window.assign((size_t) S, 0); R.outv.assign((size_t) S, 0);
+            R.dprob.assign((size_t) S, 0.0f);
+            R.sbuf.assign((size_t) S, 0);
             if (o.suffix_draft > 0) {
                 sfx.reset();
-                for (int64_t t : ids) sfx.append((int32_t) t);
+                sfx_hist.clear();
+                for (int64_t t : ids) { sfx.append((int32_t) t); if (tagged) sfx_hist.push_back((int32_t) t); }
             }
-            bool first_window = true;
-            int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
-            int64_t draft_offered = 0, draft_accepted = 0;
+            R.first_window = true;
+            R.produced_n = 0; R.sfx_windows = 0; R.sfx_drafts = 0; R.sfx_ok = 0;
+            R.draft_offered = 0; R.draft_accepted = 0;
             // what the session holds once this request is done: the prompt read so far, then every committed token
-            std::vector<int32_t> consumed;
-            consumed.reserve((size_t) (n + max_new + S));
+            std::vector<int32_t>& consumed = R.consumed;
+            consumed.clear(); consumed.reserve((size_t) (n + max_new + S));
             for (int64_t i = 0; i < n - 1; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
-            const char* finish = "length";
-            const Clock::time_point d0 = Clock::now();
+            R.finish = "length";
+            R.d0 = Clock::now();
             // STRATA_DECODE_TIMING=1: where a request's decode time goes (one line per request)
-            static const bool dec_timing = std::getenv("STRATA_DECODE_TIMING") != nullptr;
-            struct DecSnap {
-                double wait, pool, host, plan, actq, jobs, run;
-                int64_t misses, entries, hits, pcie;
-            };
-            auto dec_snap = [&]() {
-                return DecSnap{ver.ms_wait, ver.ms_pool, ver.ms_host, drive.d.ms_plan, drive.d.ms_actq, drive.d.ms_jobs,
-                               drive.d.ms_run, drive.d.multi_misses, drive.d.multi_entries, drive.d.cache_hits,
-                               drive.d.pcie_experts};
-            };
-            const DecSnap ds0 = dec_snap();
-            double dt_run = 0, dt_commit = 0, dt_draft = 0;
-            int64_t dec_windows = 0, dec_T = 0;
-            const int64_t decode_hits0 = drive.d.cache_hits;
-            const int64_t decode_look0 = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused;
+            R.ds0 = dec_snap();
+            R.dt_run = 0; R.dt_commit = 0; R.dt_draft = 0;
+            R.dec_windows = 0; R.dec_T = 0;
+            R.decode_hits0 = drive.d.cache_hits;
+            R.decode_look0 = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused;
             if (cancelled) finish = "cancel";
-            while (!cancelled && produced_n < max_new) {
-                int T = S_mtp;
-                if (req_spec_min_p > 0.0) {
-                    T = 1;
-                    while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
-                }
-                if (first_window) T = 1;
-                // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
-                // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
-                bool from_sfx = false;
-                int sfx_match = 0;
-                if (o.suffix_draft > 0 && !first_window) {
-                    const int k = sfx.propose(S - 1, sbuf.data());
-                    sfx_match = sfx.last_match();
-                    if (k > 0 && sbuf[0] == drafts[0]) {
-                        const strata::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
-                        if (pk.lookup) { T = pk.t; from_sfx = true; }
-                    }
-                }
-                const bool timed_round = !first_window;
-                const Clock::time_point round0 = Clock::now();
-                if (p + T > o.max_context) break;
-                window[0] = x;
-                for (int i = 1; i < T; ++i) window[(size_t) i] = from_sfx ? sbuf[(size_t) i - 1] : drafts[(size_t) i - 1];
-                drive.d.layers = 0;
-                drive.d.experts = 0;
-                drive.d.failed = false;
-                apply_pending(false);
-                if (hist_n > 0) {
-                    // the tails the penalties count over, ONE PER ROW: the tokens the state has consumed, the
-                    // fed-back head `x` (it joins `consumed` only after this window commits), then the drafts
-                    // before that row - what plain decode would have counted there.  (Until 0.1.19 only row 0
-                    // was staged, and the drafted rows read unwritten slots.)
-                    strata::kernels::penalty_rows(consumed.data(), (int64_t) consumed.size(), window.data(), T,
-                                                  hist_n, hist_stage.data());
-                    const strata::core::OnDevice on_h(hist_dev);
-                    cudaMemcpy(d_hist, hist_stage.data(), (size_t) T * (size_t) hist_n * sizeof(int32_t),
-                               cudaMemcpyHostToDevice);
-                }
-                tr("window", p, T);
-                const Clock::time_point tw0 = Clock::now();
-                if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
-                    std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
-                    return 1;
-                }
-                int a = 0;
-                while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
-                if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
-                const Clock::time_point tw1 = Clock::now();
-                std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
-                bool adapt_ok = true;
-                if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
-                    adapt_thr = std::thread([&] { adapt_ok = adapt(); });
-                if (!ver.commit(a + 1, err)) {
-                    if (adapt_thr.joinable()) adapt_thr.join();
-                    std::printf("ERR %s\n", err.c_str());
-                    return 1;
-                }
-                // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
-                for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
-                draft_offered += T - 1;
-                draft_accepted += a;
-                first_window = false;
-                bool eos = false;
-                for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
-                    std::printf("T %d\n", (int) outv[(size_t) i]);
-                    strata::core::progress_beat();
-                    ++produced_n;
-                    if (o.suffix_draft > 0) sfx.append(outv[(size_t) i]);
-                    eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
-                }
-                std::fflush(stdout);
-                ++rounds;
-                const Clock::time_point tw2 = Clock::now();
-                // coupled drafts with penalties: the next window's row-0 history (`consumed` holds this window's
-                // commit, outv[a] is its row 0) - the drafts extend it on the device as the verify rows will
-                if (hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
-                    mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
-                const bool drafted = eos || produced_n >= max_new ||
-                                     mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
-                {
-                    const Clock::time_point tw3 = Clock::now();
-                    auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
-                    dt_run += msd(tw0, tw1); dt_commit += msd(tw1, tw2); dt_draft += msd(tw2, tw3);
-                    ++dec_windows; dec_T += T;
-                }
-                if (adapt_thr.joinable()) adapt_thr.join();
-                if (!adapt_ok) {
-                    std::printf("ERR an adaptive refill failed\n");
-                    return 1;
-                }
-                if (!drafted) {
-                    std::printf("ERR %s\n", err.c_str());
-                    return 1;
-                }
-                if (timed_round && !eos)
-                    policy.observe(from_sfx, T, a, sfx_match,
-                                   std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
-                if (eos) { finish = "stop"; break; }
-                if (stop_req.load()) { finish = "cancel"; break; }
-                x = outv[(size_t) a];
-                p += a + 1;
+            return Step::finished;
+        };
+        // ---- phase 4: ONE verify window (draft, verify, commit, emit, re-draft).  0.1.30 looped here
+        // until the request was done; the serial loop calls this until it stops reporting
+        // `progressed`, which is the same windows in the same order.  This is what S3.1e-2 interleaves
+        // between slots, and it is also the natural pre-emption point (a window is ~16 ms).
+        //
+        // Nothing here allocates per token: the window/draft/probability buffers live in `ReqCtx` and
+        // are sized once by `finish_prefill`.
+        auto run_decode_step = [&](ReqCtx& R) -> Step {
+            const long long& max_new = R.max_new;
+            const double& req_spec_min_p = R.req_spec_min_p;
+            const int& hist_n = R.hist_n;
+            int64_t& p = R.p;
+            int32_t& x = R.x;
+            std::vector<int32_t>& drafts = R.drafts;
+            std::vector<int32_t>& window = R.window;
+            std::vector<int32_t>& outv = R.outv;
+            std::vector<int32_t>& sbuf = R.sbuf;
+            std::vector<float>& dprob = R.dprob;
+            std::vector<int32_t>& consumed = R.consumed;
+            bool& first_window = R.first_window;
+            bool& cancelled = R.cancelled;
+            int64_t& produced_n = R.produced_n;
+            int64_t& sfx_windows = R.sfx_windows;
+            int64_t& sfx_drafts = R.sfx_drafts;
+            int64_t& sfx_ok = R.sfx_ok;
+            int64_t& draft_offered = R.draft_offered;
+            int64_t& draft_accepted = R.draft_accepted;
+            const char*& finish = R.finish;
+            double& dt_run = R.dt_run;
+            double& dt_commit = R.dt_commit;
+            double& dt_draft = R.dt_draft;
+            int64_t& dec_windows = R.dec_windows;
+            int64_t& dec_T = R.dec_T;
+            // ---- S3.10: ONE TURN = UP TO --decode-tokens TOKENS, not one window. ------------------
+            // A turn used to be a single verify window: with MTP that accepts 1..8 tokens, so a slot
+            // emitted ~1-3 tokens and the scheduler paid a full save+restore (risk R10: 237 MB-2.25 GB
+            // of memcpy) to move to the next conversation.  `--decode-tokens N` makes the turn a token
+            // budget instead, which is the unit the owner asked for.  The loop below is 0.1.30's decode
+            // body verbatim; the only additions are the guard, the per-turn budget check and the
+            // `turn_windows` counter.  With N = 0/1 it runs exactly ONE iteration, so the default path is
+            // today's path by construction.
+            const int64_t budget = o.decode_tokens;
+            const int64_t produced_at_turn_start = produced_n;
+            int64_t turn_windows = 0;
+            for (;;) {
+            // 0.1.30's `while (!cancelled && produced_n < max_new)` guard, plus the turn's budget.
+            // `decode_step_tokens` is that same cap stated once: 0 means this request owes no more
+            // tokens, so no window may run.
+            if (cancelled ||
+                strata::program::serve_driver::decode_step_tokens(budget, produced_n, max_new) == 0)
+                return Step::finished;
+            // The FIRST window of a turn always runs (a turn that runs nothing is a scheduler stall).
+            // After that, the turn ends as soon as it has produced `--decode-tokens` tokens.
+            if (turn_windows > 0 &&
+                strata::program::serve_driver::decode_turn_done(budget, produced_at_turn_start, produced_n))
+                return Step::progressed;   // the turn bought its tokens: hand the session back
+            ++turn_windows;
+            int T = S_mtp;
+            if (req_spec_min_p > 0.0) {
+                T = 1;
+                while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
             }
-            const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
+            if (first_window) T = 1;
+            // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
+            // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
+            bool from_sfx = false;
+            int sfx_match = 0;
+            if (o.suffix_draft > 0 && !first_window) {
+                const int k = sfx.propose(S - 1, sbuf.data());
+                sfx_match = sfx.last_match();
+                if (k > 0 && sbuf[0] == drafts[0]) {
+                    const strata::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
+                    if (pk.lookup) { T = pk.t; from_sfx = true; }
+                }
+            }
+            const bool timed_round = !first_window;
+            const Clock::time_point round0 = Clock::now();
+            if (p + T > o.max_context) return Step::finished;
+            window[0] = x;
+            for (int i = 1; i < T; ++i) window[(size_t) i] = from_sfx ? sbuf[(size_t) i - 1] : drafts[(size_t) i - 1];
+            drive.d.layers = 0;
+            drive.d.experts = 0;
+            drive.d.failed = false;
+            // ---- S3.2b: the two residency gates every window path must pass, IN THIS ORDER. ----------
+            // 1. the pump first: `settle_pump()` marks the rows whose copies have landed RESIDENT in
+            //    `host_res`, and queues the next bounded batch on the loan's own stream.  Both are off the
+            //    window's critical path (a non-blocking stream, one batch per cache at a time, and a cache
+            //    whose loan is live is skipped entirely).
+            if (!pump_loans(err)) {
+                std::printf("%s\n", sp_out.err("walking the prompt loan home failed: " + err, R.id).c_str());
+                return Step::error;
+            }
+            // 2. then the table.  (I2): every device's `d_res` equals `host_res` at the start of every
+            // window.  Unconditional, and deliberately AFTER the pump marked whatever landed - an upload
+            // before it would leave the device told a row is a CPU miss while the host already sends it to
+            // the GPU, and the two halves of the window would disagree about the same row.  `res_upload()`
+            // decides by CONTENT, so when nothing moved this is a 96 KiB compare and no copy, and it cannot
+            // be skipped because some writer forgot to announce itself.  This is the code path that enforces
+            // "a decode window never reads a slot that does not hold its expert": the rows still out of the
+            // cache are marked non-resident in the table the window reads, so the window routes them to the
+            // CPU pool instead of to a prompt buffer.
+            reconcile_residency();
+            apply_pending(false);
+            if (hist_n > 0) {
+                // the tails the penalties count over, ONE PER ROW: the tokens the state has consumed, the
+                // fed-back head `x` (it joins `consumed` only after this window commits), then the drafts
+                // before that row - what plain decode would have counted there.  (Until 0.1.19 only row 0
+                // was staged, and the drafted rows read unwritten slots.)
+                strata::kernels::penalty_rows(consumed.data(), (int64_t) consumed.size(), window.data(), T,
+                                              hist_n, hist_stage.data());
+                const strata::core::OnDevice on_h(hist_dev);
+                cudaMemcpy(d_hist, hist_stage.data(), (size_t) T * (size_t) hist_n * sizeof(int32_t),
+                           cudaMemcpyHostToDevice);
+            }
+            tr("window", p, T);
+            const Clock::time_point tw0 = Clock::now();
+            if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
+                std::printf("%s\n", sp_out.err(drive.d.failed && drive.d.fail ? drive.d.fail : err, R.id).c_str());
+                return Step::error;
+            }
+            int a = 0;
+            while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+            if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
+            const Clock::time_point tw1 = Clock::now();
+            std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
+            bool adapt_ok = true;
+            if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
+                adapt_thr = std::thread([&] { adapt_ok = adapt(); });
+            if (!ver.commit(a + 1, err)) {
+                if (adapt_thr.joinable()) adapt_thr.join();
+                std::printf("%s\n", sp_out.err(err, R.id).c_str());
+                return Step::error;
+            }
+            // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
+            for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
+            draft_offered += T - 1;
+            draft_accepted += a;
+            first_window = false;
+            bool eos = false;
+            for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
+                std::printf("%s\n", sp_out.token(outv[(size_t) i], req_id).c_str());
+                strata::core::progress_beat();
+                ++produced_n;
+                if (o.suffix_draft > 0) { sfx.append(outv[(size_t) i]); if (tagged) sfx_hist.push_back(outv[(size_t) i]); }
+                eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
+            }
+            std::fflush(stdout);
+            // The slot's counters move once per WINDOW, not once per token: the decode path takes no lock
+            // and allocates nothing (the contract on include/strata/program/slot.hpp).
+            if (tagged) {
+                std::lock_guard<std::mutex> lk(slot_mu);
+                if (strata::program::slot::Slot* sl = slots_reg.find(req_id)) {
+                    sl->generated = produced_n;
+                    sl->ctx_used = p + a + 1;
+                }
+            }
+            ++rounds;
+            const Clock::time_point tw2 = Clock::now();
+            // coupled drafts with penalties: the next window's row-0 history (`consumed` holds this window's
+            // commit, outv[a] is its row 0) - the drafts extend it on the device as the verify rows will
+            if (hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
+                mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
+            const bool drafted = eos || produced_n >= max_new ||
+                                 mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
+            {
+                const Clock::time_point tw3 = Clock::now();
+                auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
+                dt_run += msd(tw0, tw1); dt_commit += msd(tw1, tw2); dt_draft += msd(tw2, tw3);
+                ++dec_windows; dec_T += T;
+            }
+            if (adapt_thr.joinable()) adapt_thr.join();
+            if (!adapt_ok) {
+                std::printf("%s\n", sp_out.err("an adaptive refill failed", R.id).c_str());
+                return Step::error;
+            }
+            if (!drafted) {
+                std::printf("%s\n", sp_out.err(err, R.id).c_str());
+                return Step::error;
+            }
+            if (timed_round && !eos)
+                policy.observe(from_sfx, T, a, sfx_match,
+                               std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
+            if (eos) { finish = "stop"; return Step::finished; }
+            if (stopped()) { finish = "cancel"; return Step::cancelled; }
+            x = outv[(size_t) a];
+            p += a + 1;
+            // S3.10: the window is done.  With a budget this loops and runs the NEXT window for the
+            // SAME slot (the drafts it just made are already in `drafts`, `x`/`p` are the next row), so
+            // the slot keeps the session until it has produced `--decode-tokens` tokens.  With the
+            // default budget of 0/1 the guard at the top of the loop returns here instead, which is
+            // 0.1.30's single window per step.
+            }   // S3.10: end of one decode TURN (one or more verify windows)
+        };
+        // ---- phase 5: the request's tail - the decode-timing report, the conversation state this
+        // request leaves behind, the per-request metrics and the DONE line.  0.1.30 ran it inline at
+        // the end of the body; S3.1e-2 calls it when a slot's decode step reports it is done.
+        auto finish_request = [&](ReqCtx& R) -> Step {
+            const int64_t n = R.n;
+            const int64_t& resume = R.resume;
+            const double& prompt_ms = R.prompt_ms;
+            bool& cancelled = R.cancelled;
+            std::vector<int32_t>& consumed = R.consumed;
+            int64_t& produced_n = R.produced_n;
+            int64_t& sfx_windows = R.sfx_windows;
+            int64_t& sfx_drafts = R.sfx_drafts;
+            int64_t& sfx_ok = R.sfx_ok;
+            int64_t& draft_offered = R.draft_offered;
+            int64_t& draft_accepted = R.draft_accepted;
+            const char*& finish = R.finish;
+            const Clock::time_point& d0 = R.d0;
+            const DecSnap& ds0 = R.ds0;
+            double& dt_run = R.dt_run;
+            double& dt_commit = R.dt_commit;
+            double& dt_draft = R.dt_draft;
+            int64_t& dec_windows = R.dec_windows;
+            int64_t& dec_T = R.dec_T;
+            const int64_t& decode_hits0 = R.decode_hits0;
+            const int64_t& decode_look0 = R.decode_look0;
+            const double& decode_ms = R.decode_ms;
+            std::array<int64_t, 3>& remote_before = R.remote_before;
+            std::array<int64_t, 3>& launches_before = R.launches_before;
+            std::array<uint64_t, 3>& compact_before = R.compact_before;
+            std::array<uint64_t, 3>& full_before = R.full_before;
+            std::array<double, 3>& begin_before = R.begin_before;
+            std::array<double, 3>& wait_before = R.wait_before;
+            R.decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
             if (dec_timing && dec_windows > 0) {
                 const DecSnap d1 = dec_snap();
                 const double w = (double) dec_windows, L = (double) g.n_layers;
@@ -4838,13 +7363,16 @@ int main(int argc, char** argv) {
                 live_imgs = imgs_below(req_imgs, (int64_t) live.size());
                 live_ok = o.prompt_cache > 0;
             }
+            // S3.1d: the mounted slot's mirror follows the session, so the NEXT hand-over saves what
+            // this request actually left behind rather than what it started with.
+            if (swaps_on) sync_conversation();
             static const bool state_hash = std::getenv("STRATA_STATE_HASH") != nullptr;
             if (state_hash && live_ok) {
                 // DEBUG: a fingerprint of every part of the session over the positions it holds ([0, L)), and
                 // separately of what lies past them in the last KV page (stale cells, fine unless something reads them)
                 if (cudaDeviceSynchronize() != cudaSuccess) {
-                    std::printf("ERR synchronizing state fingerprint\n");
-                    return 1;
+                    std::printf("%s\n", sp_out.err("synchronizing state fingerprint", R.id).c_str());
+                    return Step::error;
                 }
                 const int64_t L = (int64_t) live.size();
                 const strata::kernels::QsaShapes qs = [&] {
@@ -4938,8 +7466,8 @@ int main(int argc, char** argv) {
                 for (const auto& [pool, w] : kv_arrays(ms))
                     if (pool != nullptr) h_mtp = hash_cells(pool, w, 0, mL, h_mtp);
                 if (!hash_ok) {
-                    std::printf("ERR reading state fingerprint\n");
-                    return 1;
+                    std::printf("%s\n", sp_out.err("reading state fingerprint", R.id).c_str());
+                    return Step::error;
                 }
                 std::fprintf(stderr, "strata serve: STATE_HASH L=%lld gdn=%016llx ple=%016llx tail=%016llx pooled=%016llx "
                                      "kv=%016llx mtp=%016llx stale=%016llx dead=%016llx pooled_full=%016llx ple_prev=%d,%d\n", (long long) L,
@@ -4950,10 +7478,22 @@ int main(int argc, char** argv) {
             }
             const int64_t req_hits = drive.d.cache_hits - decode_hits0;
             const int64_t req_look = (drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused) - decode_look0;
+            if (tagged) {
+                std::lock_guard<std::mutex> lk(slot_mu);
+                if (strata::program::slot::Slot* sl = slots_reg.find(req_id)) {
+                    sl->prompt_ms = (int64_t) prompt_ms;
+                    sl->decode_ms = (int64_t) decode_ms;
+                    sl->generated = produced_n;
+                    sl->reused = resume;
+                    sl->ctx_used = n + produced_n;
+                }
+                slots_reg.note_ran(req_id, (int64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
+                    Clock::now().time_since_epoch()).count(), (int64_t) (prompt_ms + decode_ms));
+            }
             // DONE <generated> <prompt> <prompt ms> <decode ms> <finish> <drafts accepted> <drafts offered> <reused> [hits] [lookups]
-            std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld\n", (long long) produced_n, (long long) n, prompt_ms,
-                        decode_ms, finish, (long long) draft_accepted, (long long) draft_offered, (long long) resume,
-                        (long long) req_hits, (long long) req_look);
+            std::printf("%s\n", sp_out.done(produced_n, n, prompt_ms, decode_ms, finish,
+                                            draft_accepted, draft_offered, resume, req_hits, req_look,
+                                            req_id).c_str());
             std::fflush(stdout);
             if (drive.routing != nullptr) std::fflush(drive.routing);   // the routing trace survives a crash and is watchable mid-session
             const int64_t fresh = n - resume;
@@ -5015,6 +7555,1631 @@ int main(int argc, char** argv) {
                              (double) (remote_experts[(size_t) r].full_row_bytes() - full_before[(size_t) r]) / 1048576.0,
                              remote_experts[(size_t) r].ms_begin() - begin_before[(size_t) r],
                              remote_experts[(size_t) r].ms_wait() - wait_before[(size_t) r]);
+            return Step::finished;
+        };
+
+        // ==================== S3.1e-2: THE CONCURRENT DRIVER ====================
+        //
+        // docs/STAGE3-CONCURRENCY.md §3.1: one engine thread, N slots, ONE step at a time.  This block
+        // runs only when the registry says concurrency is on AND the slot hand-over is available, and it
+        // RETURNS before the serial driver below.  The gate is an early return rather than an `if`
+        // wrapped around the old loop, so the serial driver's text is byte-identical to 0.1.30's:
+        // §7.1's bit-exactness bar becomes a fact about the source, not a claim about behaviour.
+        //
+        // WHY `&& swaps_on`.  A slot switch IS a save/restore (§5.3).  With STRATA_NO_SWAP=1 the
+        // hand-over is disabled, so two conversations would share one session with nothing moving
+        // between them - plausible garbage, not concurrency.  S3.1d's promise is that the env switch
+        // "falls back to today's serial behaviour without recompiling", and that is what this does: the
+        // tagged wire stays on (S3.1c), the interleaving does not.
+        //
+        // WHAT A STEP IS (§3.2).  `run_prefill_step` = one prompt segment (8-15 s at 8 192 tokens),
+        // `run_decode_step` = one verify window (~16-24 ms).  Both pre-emption points already existed in
+        // 0.1.30's code; the scheduler's whole trick is to stop calling them in a `while`.
+        //
+        // ReqCtx LIFETIME - THE HARD PART.  The serial path builds one `ReqCtx` on the loop's stack and
+        // destroys it at the end of the iteration.  A step cannot: the state must outlive the step, so
+        // the driver owns `std::deque<ReqCtx> live`, keyed by request id.  A deque and not a vector
+        // because a reference into it must survive the next `push_back` - the same reason `conv_slots`
+        // is a deque.  Destruction order, checked against the serial path's (mrope scope -> slot guard
+        // -> ReqCtx -> busy scope):
+        //   * `MropeScope` and `StepGuard` are armed per STEP inside an inner scope of `run_one` and
+        //     destroyed when that scope closes - strictly EARLIER than the serial path destroyed them,
+        //     and never while a `ReqCtx` is missing (the guard's `ctx` always points at the live
+        //     context).  `drop_ctx()` - the only thing that destroys a context - runs after that scope.
+        //   * `StepGuard` is 0.1.30's `SlotGuard` plus one condition: it releases the row only once
+        //     `R.finished` is set.  Arming the serial guard per step would end every request after its
+        //     first step; arming it per request is impossible, because the request outlives the step.
+        //     `SlotGuard` itself is NOT touched, so the serial path's guard is unchanged.
+        //   * `MropeScope` keeps the serial path's exact `skip` predicate (`!swaps_on ||
+        //     !R.mrope_touched || mounted_id == req_id`), so on a normal step it does nothing and on a
+        //     bail-out it restores the mounted slot's positions - which is what R7 needs MORE with N
+        //     slots, not less.
+        //   * `cur`/`live`/`checks`/`row_ptr`/`img_rows`/`mrope_host` stay serve-scope, so nothing about
+        //     when a conversation image or a CUDA buffer exists changes.  `sp.embd_rows` is re-pointed
+        //     before every step, and R7's exclusivity is enforced at ADMISSION (below) rather than
+        //     discovered in the middle of a read.
+        //   * `progress().busy` is held for the whole driver, as `BusyScope` held it for a serial
+        //     iteration, and released while the driver blocks for a line, so an idle engine is never
+        //     reported as stalled.
+        //
+        // THE INVARIANTS THIS LOOP ENFORCES.  Each is a predicate in
+        // include/strata/program/serve_driver.hpp and each is pinned by src/program/serve_driver_test.cpp:
+        //   1. a step runs only for the slot the live session reflects (§5.3) - `dispatch_step` answers
+        //      `swap`, never a step, for anything else;
+        //   2. the prompt loan has ONE owner (R8): `loan`, mirrored by `R.loan_held`, and a slot waiting
+        //      for it is DEFERRED rather than re-picked forever;
+        //   3. at most one `swap_to` per iteration, so a refused hand-over cannot spin;
+        //   4. an admitted slot holds an active-slot permit and every exit path releases it - a stranded
+        //      permit is the one bug that would deadlock admission, because the permit bounds everything;
+        //   5. the watchdog sees one heartbeat per ACTIVE slot (R3) and the driver drains its verdicts;
+        //   6. at most one live request holds the one M-RoPE table and the one image-row pointer set
+        //      (R7), enforced at admission.
+        // The runtime form of the startup check: if the parking budget resolved to 0 after all (the
+        // machine-sized default, or a budget that only closed once the model was loaded), the swap path
+        // has nothing to save into, so interleaving would be two conversations over one session.  Fall
+        // back to the serial driver - which is exactly S3.1c's state: the tagged wire, one request at a
+        // time - and say why, on stderr, where the owner will see it.
+        const bool driver_on = slots_reg.concurrent() && swaps_on &&
+                               !strata::program::serve_driver::parking_off_refuses_slots(
+                                   slots, conversations.enabled());
+        if (slots_reg.concurrent() && !driver_on) {
+            // S3.1e-2-FALLBACK-MSG-BEGIN (runtime-gated on slots_reg.concurrent(), i.e. slots >= 2)
+            std::fprintf(stderr, "strata serve: --serve-slots %d is NOT running concurrently: %s - the serial "
+                                 "driver is serving these requests one at a time on the tagged wire "
+                                 "(S3.1c's behaviour)\n",
+                         slots, swaps_on ? "the conversation cache is off, so a slot switch would have nothing "
+                                           "to save"
+                                         : "STRATA_NO_SWAP=1 disabled the slot hand-over");
+            // S3.1e-2-FALLBACK-MSG-END
+        }
+        if (driver_on) {
+            namespace drv = strata::program::serve_driver;
+            namespace proto = strata::program::serve_proto;
+            using DStep = strata::program::serve_driver::Step;
+            using PAct = strata::program::slot::Pick::Action;
+            using SState = strata::program::slot::State;
+            // S3.6: ONE switch for every scheduler decision the owner asked to see - the pick and its
+            // `why`, each phase transition, each swap's reason, and each loan/park deferral.  Off by
+            // default so the normal log stays readable; the parking numbers and the re-read/resume
+            // events are unconditional because they are one line per decision and they are the ones
+            // that explain a request that ended early.
+            const bool serve_trace = strata::program::serve_driver::serve_trace_on();
+            if (serve_trace)
+                std::fprintf(stderr, "strata serve: STRATA_SERVE_TRACE on - one line per pick, phase "
+                                     "transition, swap and deferral\n");
+            // ---- the driver's own state --------------------------------------------------------
+            std::deque<ReqCtx> live;                       // one per admitted request, keyed by R.id
+            auto ctx_of = [&](int64_t id) -> ReqCtx* {
+                for (ReqCtx& R : live) if (R.id == id) return &R;
+                return nullptr;
+            };
+            drv::Loan loan;                                // R8: the one prompt loan, and who holds it
+            // A line that has been read and passed admission but has not been brought into the
+            // registry yet.  The ROW is created by `prep_request` (S3.1c/S3.1d own that: it is where
+            // the id is checked against the registry, the pending cancels are applied and the SLOT
+            // line goes out), so the driver cannot create it earlier without restructuring the step
+            // functions - which is not this phase's file to change.  It is tracked here instead, and
+            // it counts against the active cap: admitting ten contexts on a two-slot engine and then
+            // failing their transition to `prefilling` would leave ten requests running with no
+            // permit, which is the one accounting error that makes --serve-slots meaningless.
+            auto pending_ctx = [&]() -> ReqCtx* {
+                for (ReqCtx& Q : live) if (Q.has_line && Q.phase == drv::Phase::queued) return &Q;
+                return nullptr;
+            };
+            auto pending_count = [&]() {
+                int n = 0;
+                for (const ReqCtx& Q : live) if (Q.has_line && Q.phase == drv::Phase::queued) ++n;
+                return n;
+            };
+            // Slots whose next step needs the loan and cannot have it.  They must not be picked again
+            // until the loan is free, or the loop spins on a slot that can never advance while the
+            // holder - a different row, later in the registry's array - never gets the session.
+            std::deque<int64_t> deferred;
+            auto is_deferred = [&](int64_t id) {
+                for (const int64_t d : deferred) if (d == id) return true;
+                return false;
+            };
+            auto un_defer = [&](int64_t id) {
+                for (size_t i = 0; i < deferred.size(); ++i)
+                    if (deferred[i] == id) { deferred.erase(deferred.begin() + (std::ptrdiff_t) i); break; }
+            };
+            auto clear_deferred = [&]() { deferred.clear(); };
+            int64_t admitted = 0, steps_run = 0, swaps_done = 0, refused = 0, deferred_hits = 0;
+            bool driver_quit = false, driver_fatal = false;
+            // Did THIS pass change anything?  Declared out here because `admit_one` (defined below)
+            // sets it.  A pass that changes nothing must not become a CPU spin - see the bottom of
+            // the loop.  Named `pass_moved` because `progress()` is the heartbeat accessor.
+            bool pass_moved = true;   // true to start: the first pass must not sleep
+            // A line read from stdin that could not be admitted yet.  It is kept here rather than put
+            // back on the queue so a refusal cannot reorder the client's requests.
+            std::string held_line;
+            // Non-blocking: the driver may never wait for a line while another slot has work, or
+            // concurrency would be one request deep again.
+            auto try_next_line = [&](std::string& out) -> bool {
+                std::lock_guard<std::mutex> lk(in_mu);
+                if (in_lines.empty()) return false;
+                out = std::move(in_lines.front());
+                in_lines.pop_front();
+                return true;
+            };
+            // ---- the watchdog's per-slot record (R3) -------------------------------------------
+            // `progress().beats` is process-wide, so a slot is "current" when the counter moved while
+            // that slot was the one running.  A slot whose step began long ago and has not moved the
+            // counter is the one that is actually stuck.
+            auto watch_begin = [&](int64_t id) {
+                const uint64_t b = strata::core::progress().beats.load();
+                const int64_t t = drv::now_ms();
+                std::lock_guard<std::mutex> lk(watch_mu);
+                for (strata::program::serve_driver::SlotWatch& w : watch)
+                    if (w.id == id) { w.step_started_ms = t; w.beats_at_start = b; return; }
+                watch.push_back(strata::program::serve_driver::SlotWatch{id, t, b});
+            };
+            auto watch_idle = [&](int64_t id) {
+                std::lock_guard<std::mutex> lk(watch_mu);
+                for (strata::program::serve_driver::SlotWatch& w : watch)
+                    if (w.id == id) { w.step_started_ms = 0; return; }
+            };
+            auto watch_forget = [&](int64_t id) {
+                std::lock_guard<std::mutex> lk(watch_mu);
+                for (size_t i = 0; i < watch.size(); ++i)
+                    if (watch[i].id == id) { watch.erase(watch.begin() + (std::ptrdiff_t) i); return; }
+            };
+            // ---- the per-request prompt-path view ----------------------------------------------
+            // `sp.embd_rows` is one process-wide pointer into the serve-scope `row_ptr`, and
+            // `prep_request` set it for whichever request arrived last.  With N slots the driver has to
+            // re-point it before every step, or a text request's step would read an image request's
+            // rows.  Safe because admission keeps at most one GENI request live (R7).
+            auto arm_prompt_view = [&](ReqCtx& R) {
+                sp.embd_rows = R.geni ? row_ptr.data() : nullptr;
+            };
+            // The segment end the NEXT prefill step will read to, so `windows_ok` can be asked with the
+            // same arguments 0.1.30's `for` used.  `run_prefill_step` re-derives it identically.
+            auto next_segment_end = [&](const ReqCtx& R) -> int64_t {
+                for (size_t i = R.seg_i; i < R.seg.size(); ++i)
+                    if (R.seg[i] > R.at) return R.seg[i];
+                return -1;
+            };
+            // Does this slot's NEXT prefill segment need the prompt loan?  The same test
+            // `run_prefill_step` applies to itself: a segment that goes through the verify windows
+            // refills first, a batched one lends, and "no segment left" touches neither.  Asked
+            // before the step so the slot can be DEFERRED rather than run and refused - and asked
+            // about the step the slot would actually run, so a cancelled slot (whose dispatch is the
+            // phase tail, which never lends) is never parked behind a loan it does not need.
+            auto segment_needs_loan = [&](const ReqCtx& R) -> bool {
+                for (size_t i = R.seg_i; i < R.seg.size(); ++i) {
+                    if (R.seg[i] <= R.at) continue;
+                    return !windows_ok(R.at, R.seg[i]);
+                }
+                return false;
+            };
+            // Put THIS request's prompt state back where 0.1.30's body left it for the whole request.
+            // Four of these are serve-scope counters the PP line and the mid-prompt checkpoints read,
+            // and one is not a counter at all: `cur` is the token array `checkpoint_at` copies
+            // (`cur[0, L)`) and the prompt path's chunk callback indexes (`cur[p0 + t + 1]`).  A step
+            // that left `cur` holding another request's tokens would checkpoint THAT sequence under
+            // this request's id - silent, and exactly the kind of plausible-garbage bug the design
+            // refuses.  0.1.30 set it once per request (`cur = ids` in `prep_request`); with N slots
+            // the driver re-arms it before every prefill step.
+            int64_t prompt_owner = proto::kNoId;
+            auto arm_prompt_state = [&](ReqCtx& R) {
+                pp_total = R.pp_total; pp_from = R.pp_from;
+                pp_t0 = R.pp_t0; pp_next_check = R.pp_next_check;
+                cur = R.ids;
+                // S3.8: and the pictures.  `checkpoint_at` stamps `c.imgs = imgs_below(req_imgs, L)`,
+                // and `req_imgs` names whichever request was prepped LAST - so a prefill resumed after
+                // a hand-over would stamp ANOTHER conversation's image keys onto this branch's
+                // checkpoints.  `ReqCtx::own_imgs` exists precisely to stop that; re-arming `cur`
+                // without it left the hole open.  Silent, and it corrupts the cache's prefix
+                // comparison for every later request of this chat.
+                req_imgs = R.own_imgs;
+                {
+                    // A layer split's per-stage mid-prompt parts are keyed by POSITION, and two
+                    // requests reach the same positions.  When the request being prefilling changes,
+                    // whatever the stages had accumulated for the previous one is now a partial set
+                    // for a sequence that is not running: drop it.  (An incomplete set is already
+                    // handled - `sp.on_chunk` skips the checkpoint rather than saving a mixed one -
+                    // but dropping it is what lets the NEXT checkpoint of the new request be real.)
+                    std::lock_guard<std::mutex> lk(part_mu);
+                    if (prompt_owner != R.id) { part_at.clear(); prompt_owner = R.id; }
+                    std::fill(part_next.begin(), part_next.end(), pp_next_check);
+                }
+            };
+            // ---- §3.4's refuse edge: ERR, release the row, free the permit, keep the process -----
+            // This is also risk R4's fix: 0.1.30's parking failure was a `return 1`, which took the
+            // whole server down over one conversation.
+            auto refuse_line = [&](int64_t id, const std::string& why) {
+                // A row that belongs to a request the driver is ALREADY running must not be released
+                // by a refusal aimed at a new line: the duplicate-id case below is the one way that
+                // happens, and killing the healthy request would be worse than the bad line.  Its ERR
+                // goes out untagged, so it lands on the server's control queue instead of that
+                // request's stream.
+                const bool owns_live = ctx_of(id) != nullptr;
+                std::printf("%s\n", sp_out.err(why, owns_live ? proto::kNoId : id).c_str());
+                std::fflush(stdout);
+                if (owns_live) { ++refused; return; }
+                std::lock_guard<std::mutex> lk(slot_mu);
+                if (slots_reg.find(id) != nullptr) {
+                    std::string serr;
+                    slots_reg.transition(id, SState::error, serr);
+                    slots_reg.release(id);
+                }
+                ++refused;
+            };
+            // A slot the driver IS running, ended abnormally: ERR tagged to it, its row destroyed,
+            // its permit freed.  Distinct from `refuse_line`, which answers a line that never became a
+            // slot (and must therefore NOT touch a row another request owns).
+            auto end_slot = [&](int64_t id, const std::string& why) {
+                std::printf("%s\n", sp_out.err(why, id).c_str());
+                std::fflush(stdout);
+                std::lock_guard<std::mutex> lk(slot_mu);
+                if (slots_reg.find(id) != nullptr) {
+                    std::string serr;
+                    slots_reg.transition(id, SState::error, serr);
+                    slots_reg.release(id);
+                }
+                if (mounted_id == id) mounted_id = proto::kNoId;
+                ++refused;
+            };
+
+            // ---- S4.2 "hold, don't reject" (stage 4, decision D5) -------------------------------
+            // The owner's complaint: "if there is no budget to park a conversation or different
+            // circumstances requests get rejected with an error. That is bad, instead, those requests
+            // should be put on hold and be executed as soon as there are ressources free instead of
+            // cancelled."  So a request that cannot run NOW is queued, not ERRed.  Only a request that
+            // can NEVER run on this engine is an error, and `serve_driver::admit_decision` is the one
+            // place that says which is which.
+            //
+            // THE RULES, all of them predicates in serve_driver.hpp and pinned by serve_driver_test:
+            //   * the queue is FIFO, with one documented exception (a request that already holds a
+            //     conversation outranks one that has never run - it has tokens on the wire);
+            //   * it is BOUNDED twice: `--hold-ms` (0 = wait forever) and `WaitQueue::cap`, because an
+            //     unbounded queue is a memory leak with a nicer name;
+            //   * it is VISIBLE: `waiting=N` in the activity line, `WAIT n oldest_ms reason` lines, and
+            //     the same numbers on the server's /status and /slots;
+            //   * an expired wait is an honest ERR that names what it waited for, never a silent drop;
+            //   * `STOP <id>` cancels a waiter and answers it `DONE ... cancel` - it is never run and
+            //     then cancelled, which would emit tokens to a client that asked us to stop.
+            // The waiter's request LINE lives in `hold_lines` and is NOT removed until the request is
+            // actually brought in, so retrying a waiter every pass cannot reorder the queue.
+            drv::WaitQueue holds(o.hold_ms);
+            std::deque<std::pair<int64_t, std::string>> hold_lines;   // waiter id -> its request line
+            auto hold_find_line = [&](int64_t id) -> std::string* {
+                for (std::pair<int64_t, std::string>& e : hold_lines)
+                    if (e.first == id) return &e.second;
+                return nullptr;
+            };
+            auto hold_forget = [&](int64_t id) {
+                for (size_t i = 0; i < hold_lines.size(); ++i)
+                    if (hold_lines[i].first == id) { hold_lines.erase(hold_lines.begin() + (std::ptrdiff_t) i); return; }
+            };
+            // Record why a waiter waits.  `set_reason` returns true only when the reason CHANGED, which
+            // is the cue to print `hold_line` once - the driver's pass loop runs thousands of times a
+            // second, and a per-pass line would bury every other line in the log.
+            auto note_wait = [&](int64_t id, drv::Wait why) {
+                if (holds.set_reason(id, why))
+                    std::fprintf(stderr, "%s\n", drv::hold_line(id, why, holds.size()).c_str());
+            };
+            // Put a parsed request into the hold queue (or just refresh its reason if it is already
+            // there, which is the case for a waiter retried on a later pass).
+            auto hold_enqueue = [&](const proto::Request& probe, const std::string& line,
+                                    drv::Wait why, uint64_t price_bytes) {
+                const int64_t now = drv::now_ms();
+                if (holds.find(probe.id) == nullptr) {
+                    // A request that already has a parked branch of its own (the same chat ran before)
+                    // outranks a brand-new one: ending it costs a user an answer they are half-reading.
+                    const bool resumed = conversations.probe(probe.ids, std::vector<
+                                          strata::core::ConversationImageKey>{}, probe.cvec != 0,
+                                          probe.id).tokens > 0;
+                    if (!holds.enqueue(probe.id, why, now,
+                                       resumed ? drv::kPriorityResumed : drv::kPriorityNew,
+                                       (int64_t) probe.ids.size(), probe.max_new, price_bytes,
+                                       probe.kind == proto::Kind::geni)) {
+                        // The queue is full.  That is a refusal, and it says so with the queue's own
+                        // bound rather than pretending the request is being held.
+                        refuse_line(probe.id, std::string("the hold queue is full (") +
+                                              std::to_string((long long) holds.cap()) +
+                                              " requests can wait at once; --hold-ms " +
+                                              std::to_string((long long) holds.hold_ms()) +
+                                              " ms bounds each wait)");
+                        holds.note_refused();
+                        return false;
+                    }
+                    hold_lines.push_back(std::make_pair(probe.id, line));
+                    std::fprintf(stderr, "%s\n", drv::hold_line(probe.id, why, holds.size()).c_str());
+                } else {
+                    note_wait(probe.id, why);
+                }
+                return true;
+            };
+            // Answer a waiter that gave up or was cancelled, and forget it.  Both numbers, always:
+            // "it is queued" and "it is lost" must never look the same in the log.
+            auto hold_expire = [&](int64_t id) {
+                const int64_t now = drv::now_ms();
+                const int64_t waited = holds.waited_ms(id, now);
+                const drv::Wait why = holds.reason_of(id);
+                std::printf("%s\n", sp_out.err(drv::hold_expired_line(id, waited, why, holds.hold_ms()),
+                                               id).c_str());
+                std::fflush(stdout);
+                holds.pop(id);
+                holds.note_expired();
+                hold_forget(id);
+                ++refused;
+            };
+            auto hold_cancel = [&](int64_t id) {
+                drv::Waiter w;
+                if (!holds.cancel(id, w)) return;
+                // The client is still waiting on this request, so it gets an answer: 0 tokens, finish
+                // `cancel` - the same shape a request cancelled at admission gets.
+                std::printf("%s\n", sp_out.done(0, w.prompt_tokens, 0.0, 0.0, "cancel", 0, 0, 0, 0, 0,
+                                                id).c_str());
+                std::fflush(stdout);
+                hold_forget(id);
+                std::fprintf(stderr, "strata serve: slot %lld cancelled after waiting %lld ms - it never "
+                                     "reached the engine\n", (long long) id,
+                             (long long) (drv::now_ms() - w.since_ms));
+            };
+            // The engine's queue, on the wire, so `serve/server.py` can show waits it cannot see from
+            // the outside.  Untagged (it is about the process, like SLOT), and only when there is
+            // something to say or the situation changed - never on the serial path, which never gets
+            // here at all.
+            int64_t next_wait_line_ms = 0;
+            int64_t next_promote_ms = 0;
+            size_t last_wait_reported = 0;
+            auto report_waits = [&]() {
+                const int64_t now = drv::now_ms();
+                if (holds.empty() && last_wait_reported == 0) return;
+                if (holds.size() != last_wait_reported || now >= next_wait_line_ms) {
+                    std::printf("%s\n", drv::wait_line(holds.size(), holds.oldest_wait_ms(now),
+                                                       holds.head_reason()).c_str());
+                    std::fflush(stdout);
+                    last_wait_reported = holds.size();
+                    next_wait_line_ms = now + 2000;
+                }
+            };
+            // Drop a finished or refused request's context.  Called only after the step's guards have
+            // run, so ~StepGuard never sees a destroyed ReqCtx.
+            auto drop_ctx = [&](int64_t id) {
+                // S4.2: this is THE wake point.  A context going away is the only thing that returns an
+                // active-slot permit, the RAM it was priced against, and the prompt loan - so it is
+                // where a waiter becomes runnable.  Clear every recorded reason (a waiter parked behind
+                // RAM may now be blocked by the cap instead, and a reason that is never re-derived is
+                // how a stale "waiting for RAM" line outlives the RAM problem) and let the next pass
+                // re-ask the head immediately instead of waiting for the rate limit.
+                if (!holds.empty()) { holds.wake_all(); next_promote_ms = 0; }
+                for (size_t i = 0; i < live.size(); ++i) {
+                    if (live[i].id != id) continue;
+                    if (live[i].loan_held) {
+                        // S3.2b: the ENGINE's view of the loan (`PfPart::loan_live`) has to be cleared too,
+                        // not just the driver's.  A stranded `loan_live` is not a wrong token - the rows are
+                        // all correctly marked non-resident - but it refuses the pump for every cache
+                        // forever, so the experts the prompt evicted would never come back.  `refill()` is a
+                        // no-op when nothing is lent, and under the lazy rule it copies nothing.
+                        if (!refill(err)) {
+                            std::fprintf(stderr, "strata serve: slot %lld: returning its loan failed (%s)\n",
+                                         (long long) id, err.c_str());
+                            err.clear();
+                        }
+                        loan.release(id);
+                        live[i].loan_held = false;
+                        // A slot that dies mid-read must wake the slots parked behind its loan, or a
+                        // dead holder strands every prefill in the process.
+                        if (!loan.held()) clear_deferred();
+                    }
+                    live.erase(live.begin() + (std::ptrdiff_t) i);
+                    break;
+                }
+                // S3.6: the slot no longer owes itself a step, so a later hand-over may drop its
+                // in-session branch without a guard refusing it.
+                working_drop(id);
+                // S3.9: and its parked entry stops being claimed.  The branch itself stays in the
+                // cache - that is stage 2's mechanism, the next request of the same chat resumes from
+                // it - but it is no longer a live conversation that another mount would destroy.
+                release_conv_claims(id);
+                watch_forget(id);
+                for (size_t i = 0; i < deferred.size(); ++i)
+                    if (deferred[i] == id) { deferred.erase(deferred.begin() + (std::ptrdiff_t) i); break; }
+            };
+            // The watchdog's verdict: ERR + destroy THAT slot, keep the engine and the other slots.
+            auto kill_slot = [&](int64_t id) {
+                ReqCtx* R = ctx_of(id);
+                if (R == nullptr) return;
+                std::fprintf(stderr, "strata serve: slot %lld made no progress within %d s - ending it and "
+                                     "keeping the engine (stage 3 R3)\n", (long long) id, watchdog_limit_s);
+                if (R->loan_held) {
+                    if (!refill(err))
+                        std::fprintf(stderr, "strata serve: slot %lld: refilling its loan failed (%s)\n",
+                                     (long long) id, err.c_str());
+                    err.clear();
+                    loan.release(id);
+                    R->loan_held = false;
+                    clear_deferred();
+                }
+                R->finished = true;
+                std::printf("%s\n", sp_out.err("no progress within the watchdog limit - this request was ended;"
+                                               " the engine stayed up", id).c_str());
+                std::fflush(stdout);
+                slot_step(id, SState::error);
+                slot_finish(id);
+                drop_ctx(id);
+            };
+            // S3.7: the startup worst-case snapshot, and the per-token rate it implies.  Declared here
+            // because `admit_one` below reads it; FILLED just before the loop runs, which is before any
+            // call site of this lambda, so the reference capture is honest rather than lucky.
+            drv::ParkCeiling ceiling;
+            // ---- admit: take one queued line and bring it in (§3.1 step 1) ----------------------
+            // S4.2 turns this from "admit or ERR" into three questions, and only the third may create a
+            // context:
+            //   1. is the line a request at all (QUIT / STOP / a parse error)?
+            //   2. `admit_decision` - can it NEVER run here (an ERR), can it run NOW, or must it WAIT
+            //      (and for which resource)?  A temporary answer queues it, it does not cancel it.
+            //   3. `promote_waiters` - the head of the queue that now fits becomes the context.
+            // Still at most ONE admission per pass, so a burst of lines cannot starve running slots.
+
+            // Everything the admission decision needs for one parsed request, computed once.  The
+            // decision itself is `serve_driver::admit_decision` - a tested predicate - so the ORDER of
+            // these checks, and therefore the reason a request waits, is pinned by the CPU test rather
+            // than being an accident of this call site.
+            struct AdmitInput {
+                drv::Admit a;
+                drv::SlotCost cost;
+                uint64_t est = 0;
+            };
+            // "priced at N B per context token (...)" - the same wording S3.7 introduced, now shared by
+            // the wait line and the never-fits error so both name the two real numbers.
+            auto price_note = [&](const AdmitInput& in) {
+                if (in.cost.per_token) {
+                    return std::string("priced at ") + std::to_string((long long) in.cost.per_token) +
+                           " B per context token (" +
+                           (park_per_token_tokens
+                                ? "the rate of the largest park so far, " +
+                                  std::to_string((long long) park_per_token_tokens) + " tokens"
+                                : "the rate this --max_context implies") +
+                           ")";
+                }
+                return std::string("priced at the budget/slots estimate: nothing has been parked and a "
+                                   "snapshot could not be sized at --max_context");
+            };
+            // The one line that explains a RAM wait or a RAM refusal, with BOTH numbers.  S3.7's lesson:
+            // an admission answer that names no number is an answer nobody can act on.
+            auto admit_diag = [&](int64_t id, const AdmitInput& in) {
+                std::fprintf(stderr, "strata serve: admit slot %lld held back: %lld prompt tokens priced at "
+                                     "%lld MiB of snapshot (%lld MiB already held by other slots, %lld MiB "
+                                     "free, floor %lld MiB) - %s\n",
+                             (long long) id, (long long) in.a.prompt_tokens, (long long) (in.est >> 20),
+                             (long long) (in.a.held_bytes >> 20),
+                             in.a.have_telemetry ? (long long) (in.a.avail_bytes >> 20) : -1LL,
+                             (long long) (in.a.floor_bytes >> 20), price_note(in).c_str());
+            };
+            auto ask_admission = [&](const proto::Request& probe, AdmitInput& in, drv::Wait& why) {
+                const auto avail = strata::core::conversation_available_memory();
+                // A GENI request's prompt lives in the embeddings file, so its token count is not on the
+                // request line. Price it at the ceiling - the honest worst case - rather than at zero.
+                const uint64_t prompt_tokens = probe.kind == proto::Kind::geni
+                                                   ? (uint64_t) o.max_context
+                                                   : (uint64_t) probe.ids.size();
+                const uint64_t max_new = (uint64_t) (probe.max_new > 0 ? probe.max_new : 0);
+                in.cost = drv::slot_cost_of((uint64_t) conversations.budget(),
+                                            conversations.slots(), ceiling, park_per_token);
+                in.est = drv::slot_image_bytes(in.cost, prompt_tokens, max_new);
+                uint64_t held = 0;
+                bool any_live = false, image_live = false;
+                for (const ReqCtx& Q : live) {
+                    held += (uint64_t) (Q.image_bytes > 0 ? Q.image_bytes : 0);
+                    any_live = true;
+                    image_live = image_live || Q.geni;
+                }
+                // R7, as an admission rule rather than a mid-read discovery: `mrope_host`/`d_mrope` and
+                // the one `row_ptr`/`img_rows` set describe ONE sequence, so an image request runs alone.
+                const bool want_image = probe.kind == proto::Kind::geni;
+                bool cap_free = false, row_free = false;
+                {
+                    std::lock_guard<std::mutex> lk(slot_mu);
+                    // The cap, counting the contexts already waiting to be brought in.
+                    cap_free = slots_reg.can_admit() &&
+                               slots_reg.active_count() + pending_count() < slots;
+                    row_free = slots_reg.count() < strata::program::slot::kMaxSlots;
+                }
+                in.a = drv::Admit{};
+                in.a.prompt_tokens = (int64_t) prompt_tokens;
+                in.a.max_new = probe.max_new;
+                in.a.max_context = o.max_context;
+                in.a.prompt_known = probe.kind != proto::Kind::geni;
+                in.a.cache_enabled = conversations.enabled();
+                in.a.have_telemetry = avail.has_value();
+                in.a.avail_bytes = avail.value_or(0);
+                in.a.floor_bytes = (uint64_t) o.conversation_cache_min_free_mib * 1024ull * 1024ull;
+                in.a.price_bytes = in.est;
+                in.a.uncapped_price = drv::slot_price_uncapped(in.cost, prompt_tokens, max_new);
+                in.a.held_bytes = held;
+                in.a.budget_bytes = (uint64_t) conversations.budget();
+                in.a.cap_free = cap_free;
+                in.a.row_free = row_free;
+                in.a.image_ok = !(image_live || (want_image && any_live));
+                return drv::admit_decision(in.a, why);
+            };
+            // The ERR for a request that can NEVER run here.  Named per reason, because "the server is
+            // full" and "your prompt does not fit" are different messages to different readers, and the
+            // whole point of the hold queue is that the first one is no longer an error at all.
+            auto permanent_admit_reason = [&](const AdmitInput& in) {
+                if (!in.a.cache_enabled)
+                    return std::string(drv::refuse_reason(drv::Refuse::no_parking));
+                if (in.a.prompt_known &&
+                    drv::prompt_never_fits(in.a.prompt_tokens, in.a.max_new, in.a.max_context))
+                    return std::string("the prompt is ") + std::to_string((long long) in.a.prompt_tokens) +
+                           " tokens and the answer may add " + std::to_string((long long) in.a.max_new) +
+                           ", which does not fit --max-context " +
+                           std::to_string((long long) in.a.max_context) +
+                           " - send a shorter prompt or raise --max-context";
+                return std::string("this request's conversation (" +
+                                   std::to_string((long long) (in.est >> 20)) + " MiB) does not fit the free "
+                                   "RAM on this machine even if every other request finished (" +
+                                   std::to_string((long long) (in.a.avail_bytes >> 20)) + " MiB free, floor " +
+                                   std::to_string((long long) (in.a.floor_bytes >> 20)) + " MiB) - " +
+                                   price_note(in) + ". Give the machine more RAM or lower --max-context");
+            };
+            // Bring one request in: its context, its working-branch claim, its place in the accounting.
+            auto open_ctx = [&](const proto::Request& probe, const std::string& line, uint64_t est) {
+                live.push_back(ReqCtx{});
+                ReqCtx& R = live.back();
+                R.line = line;
+                R.has_line = true;
+                R.id = probe.id;
+                R.image_bytes = (int64_t) est;
+                // S3.6: this slot now owes itself a step, so `swap_to` must be able to save it before
+                // it hands the session to anybody else.  `working_state` refreshes it from the phase
+                // after every step and `drop_ctx` removes it.
+                working_set(probe.id, strata::program::serve_swap::Outgoing::re_readable);
+                pass_moved = true;
+                ++request_index;      // S0.3 lever 4: the parking backoff's window is in requests
+            };
+            auto admit_one = [&]() {
+                // A line already read but not admitted: retry it before reading another, so the
+                // client's order is kept.
+                if (held_line.empty()) {
+                    if (!try_next_line(held_line)) return;
+                }
+                // `pass_moved` is set only where a line is CONSUMED or a context is CREATED.  A
+                // deferral (the cap is full, an image request holds the position table) must leave it
+                // false, or the loop's anti-spin backstop at the bottom never fires.
+                if (held_line == "QUIT") { driver_quit = true; held_line.clear(); pass_moved = true; return; }
+                const proto::Request probe = proto::parse_request(
+                    held_line, proto::Defaults{o.pcie_frac, o.spec_min_p}, tagged);
+                if (probe.kind == proto::Kind::stop) {
+                    // A STOP that reached the queue instead of the stdin thread.  `STOP <id>` names a
+                    // slot; a bare STOP keeps 0.1.30's meaning ("the running one"), which
+                    // `bare_stop_target` resolves through the registry.
+                    std::lock_guard<std::mutex> lk(slot_mu);
+                    if (probe.id != proto::kNoId) {
+                        // S4.2: a waiter is cancelled directly - it has no registry row to cancel, and
+                        // recording it in `pending_cancel` as well would leave a stale entry that could
+                        // wrongly cancel a later request reusing the same id.
+                        if (holds.contains(probe.id)) hold_cancel(probe.id);
+                        else if (!slots_reg.cancel_request(probe.id) && pending_cancel.size() < 64)
+                            pending_cancel.push_back(probe.id);
+                    } else {
+                        const int64_t who = drv::bare_stop_target(slots_reg);
+                        if (who != proto::kNoId) slots_reg.cancel_request(who);
+                    }
+                    held_line.clear();
+                    pass_moved = true;
+                    return;
+                }
+                if (probe.kind != proto::Kind::gen && probe.kind != proto::Kind::geni) {
+                    // 0.1.30's untagged ERR for a line it could not attribute to anything.
+                    std::printf("%s\n", sp_out.err(probe.error.empty() ? proto::err_expected()
+                                                                       : probe.error).c_str());
+                    std::fflush(stdout);
+                    held_line.clear();
+                    pass_moved = true;
+                    return;
+                }
+                if (probe.id == proto::kNoId) {   // a tagged session needs an id to route by
+                    refuse_line(probe.id, "this engine was started with --serve-slots " + std::to_string(slots) +
+                                          ": requests need a request id (GEN <id> <max_new> ...)");
+                    held_line.clear();
+                    pass_moved = true;
+                    return;
+                }
+                if (ctx_of(probe.id) != nullptr) {
+                    refuse_line(probe.id, "request id " + std::to_string((long long) probe.id) +
+                                          " is already running");
+                    held_line.clear();
+                    pass_moved = true;
+                    return;
+                }
+                if (holds.contains(probe.id)) {
+                    // An impatient client re-sent a request that is ALREADY waiting.  It is not an error
+                    // and it must not enter the queue twice (two rows for one id would make the wire
+                    // unparseable).  Refresh its place in the log and move on.
+                    std::fprintf(stderr, "strata serve: slot %lld is already waiting (%s, %lld ms so far)\n",
+                                 (long long) probe.id, drv::wait_reason(holds.reason_of(probe.id)),
+                                 (long long) holds.waited_ms(probe.id, drv::now_ms()));
+                    held_line.clear();
+                    pass_moved = true;
+                    return;
+                }
+                AdmitInput in;
+                drv::Wait why = drv::Wait::none;
+                const drv::Hold h = ask_admission(probe, in, why);
+                if (h == drv::Hold::error) {
+                    // The one case that is still an ERR: this request can never run on this engine.
+                    refuse_line(probe.id, permanent_admit_reason(in));
+                    held_line.clear();
+                    pass_moved = true;
+                    return;
+                }
+                if (h == drv::Hold::wait) {
+                    // HOLD, DON'T REJECT.  The request is queued and will run when the resource it names
+                    // frees; the client sees a slow first token, not an error.
+                    if (why == drv::Wait::ram) admit_diag(probe.id, in);
+                    hold_enqueue(probe, held_line, why, in.est);
+                    held_line.clear();
+                    pass_moved = true;   // the line WAS consumed
+                    return;
+                }
+                open_ctx(probe, held_line, in.est);
+                held_line.clear();
+            };
+            // ---- S4.2: let the queue through -----------------------------------------------------
+            // A resource came back (a slot finished, a park landed, the loan was released, a branch was
+            // pruned, a waiter expired), so re-ask the head of the queue.  One promotion per pass,
+            // exactly as a fresh line gets one admission per pass, and the head is the only candidate:
+            // letting a later waiter past an earlier one is how a queue stops being a queue.
+            auto promote_waiters = [&]() {
+                for (;;) {
+                    const drv::Waiter* w = holds.head();
+                    if (w == nullptr) return;
+                    const int64_t id = w->id;
+                    std::string* line = hold_find_line(id);
+                    if (line == nullptr) {
+                        // Bookkeeping net: a waiter with no line cannot be dispatched.  Drop it rather
+                        // than wedge the queue forever behind it.
+                        holds.pop(id);
+                        continue;
+                    }
+                    const proto::Request probe = proto::parse_request(
+                        *line, proto::Defaults{o.pcie_frac, o.spec_min_p}, tagged);
+                    if (probe.kind != proto::Kind::gen && probe.kind != proto::Kind::geni) {
+                        refuse_line(probe.id, probe.error.empty() ? proto::err_expected() : probe.error);
+                        holds.pop(id); hold_forget(id);
+                        continue;
+                    }
+                    // A `STOP <id>` that arrived while this request waited.  The stdin thread cannot see
+                    // the hold queue (it is created before it), so it recorded the cancel in
+                    // `pending_cancel`.  Answer it HERE, before the request becomes a context: a waiter
+                    // that was cancelled is never run and then cancelled, which would emit tokens to a
+                    // client that asked us to stop.
+                    for (size_t k = 0; k < pending_cancel.size(); ++k) {
+                        if (pending_cancel[k] != id) continue;
+                        pending_cancel.erase(pending_cancel.begin() + (std::ptrdiff_t) k);
+                        const int64_t waited = holds.waited_ms(id, drv::now_ms());
+                        drv::Waiter cw;
+                        if (holds.cancel(id, cw)) {
+                            hold_forget(id);
+                            std::printf("%s\n", sp_out.done(0, (int64_t) probe.ids.size(), 0.0, 0.0,
+                                                            "cancel", 0, 0, 0, 0, 0, id).c_str());
+                            std::fflush(stdout);
+                            std::fprintf(stderr, "strata serve: slot %lld cancelled after waiting %lld ms "
+                                                 "- it never reached the engine\n", (long long) id,
+                                         (long long) waited);
+                        }
+                        pass_moved = true;
+                        break;
+                    }
+                    if (holds.find(id) == nullptr) continue;   // it was cancelled just now
+                    AdmitInput in;
+                    drv::Wait why = drv::Wait::none;
+                    const drv::Hold h = ask_admission(probe, in, why);
+                    if (h == drv::Hold::error) {
+                        // It waited, and it turns out it can never run.  Say so with the real reason -
+                        // a hold timeout blaming the load would send the owner to the wrong knob.
+                        end_slot(id, permanent_admit_reason(in));
+                        holds.pop(id); holds.note_expired(); hold_forget(id);
+                        continue;
+                    }
+                    if (h == drv::Hold::wait) {
+                        // Still blocked.  Report the CURRENT reason (it may have moved from RAM to the
+                        // cap) and stop: the head is the head.
+                        if (holds.set_reason(id, why) && why == drv::Wait::ram) admit_diag(id, in);
+                        return;
+                    }
+                    const int64_t waited = holds.waited_ms(id, drv::now_ms());
+                    const std::string line_copy = *line;
+                    holds.pop(id);
+                    holds.note_admitted();
+                    hold_forget(id);
+                    // The wait is REPORTED, because §7.2's rule is that a request which waited must say
+                    // so - otherwise its `prompt_ms` reads like a slowdown in the engine.
+                    std::fprintf(stderr, "%s\n", drv::hold_admitted_line(id, waited).c_str());
+                    open_ctx(probe, line_copy, in.est);
+                    return;
+                }
+            };
+            // ---- S4.2: the queue's own deadlines --------------------------------------------------
+            // A wait with no bound is a hung client.  Expired waiters are answered where they are found,
+            // and each one names what it waited for.  `STOP <id>` is handled in `admit_one`, by the
+            // stdin thread and here; the watchdog deliberately never sees a waiter
+            // (`watchdog_sees_waiters`), because a waiter is not inside a step and killing one would be
+            // R3 in a new costume.  `--hold-ms 0` means the bound is off and only a cancel ends a wait.
+            auto expire_waiters = [&]() {
+                for (const int64_t id : holds.expired(drv::now_ms())) {
+                    hold_expire(id);
+                    pass_moved = true;
+                }
+            };
+            // ---- the hand-over (§3.1 step 3) ---------------------------------------------------
+            // `swap_to` owns the order, the residency drain and the loan return (S3.1d) - the driver
+            // only decides WHEN, and it never retries a hand-over that already wrote the session.
+            //
+            // S3.6: the return type is the driver's own `SwapResult`, not a bool, because a refused
+            // hand-over now has TWO answers and they are opposite:
+            //   * `wait_park`     - the session is mid-read and cannot be saved YET.  The incoming slot
+            //                       waits; the outgoing one keeps the session.  This is the ordinary
+            //                       two-client race, and it must not be an error.
+            //   * `end_incoming`  - the outgoing conversation can NEVER be parked here.  The incoming
+            //                       request is answered with an ERR naming both numbers, its permit
+            //                       comes back, and the session is untouched.  Refused, not starved and
+            //                       not spun on.
+            // Both stop the retry-without-a-restore path, because that retry is exactly what used to
+            // destroy a running conversation.
+            auto do_swap = [&](ReqCtx& R, std::string& serr, const char* why) -> drv::SwapResult {
+                // The image to mount: this slot's parked branch, if the cache still holds one.  A slot
+                // being admitted for the first time has no branch yet and `prep_request` does 0.1.30's
+                // own mount search for it, so the driver only mounts a slot it has already run.
+                //
+                // S3.7: the lookup is `serve_swap::seek_mount_index`, and it is NOT the prefix search
+                // `prep_request` uses.  A hand-over wants the branch that IS this slot's sequence;
+                // `ConversationCache::best()` requires a strictly shorter token list and answers 0 for
+                // the one conversation the cache parked for it.  That is what ended the owner's
+                // requests mid-decode with an ERR blaming the parking budget, on a run whose budget
+                // was 10 048 MiB and whose branch 113 MiB.
+                if (R.phase != drv::Phase::queued && mount_image == std::nullopt) {
+                    const strata::program::serve_swap::SlotConv& c = conv_of(R.id);
+                    const int64_t idx = strata::program::serve_swap::seek_mount_index(conversations, c);
+                    if (idx >= 0) mount_image.emplace(conversations.take((size_t) idx));
+                    else if (strata::program::serve_swap::handover_seeks(c) &&
+                             R.phase == drv::Phase::decode)
+                        // S3.8: DECODE only, and that is the whole point.  A decoder's prompt tokens
+                        // are already on the wire, so losing its branch is unrecoverable and this is
+                        // the one case that ends a running request.  A PREFILL slot that finds nothing
+                        // parked can still re-read - bounded by `kMaxRereads`, and `step_gate` reports
+                        // it - so it is not named here.  (The old one-argument `outgoing_for` would
+                        // now answer `re_readable` for a prefill regardless of its cursor, which is
+                        // exactly the ambiguity this avoids.)
+                        std::fprintf(stderr, "strata serve: swap: slot %lld's parked branch "
+                                             "(%zu tokens) is no longer in the cache - pruned or replaced "
+                                             "while the slot waited, and a decoder cannot re-read what it "
+                                             "has already sent (parked=%zu entries, %zu MiB of a %zu MiB "
+                                             "budget)\n",
+                                     (long long) R.id, c.live.size(),
+                                     conversations.size(), conversations.bytes() >> 20,
+                                     conversations.budget() >> 20);
+                }
+                // R8, and the invariant the whole loan rule rests on: a hand-over refills
+                // (`serve_swap::run`'s `return_loan` step, which always runs when the hand-over runs),
+                // so it ends the current holder's loan whether the hand-over succeeds or fails - and
+                // the driver's view has to say the same thing the caches now do.  `swap_to` returns
+                // true WITHOUT refilling when the slot is already mounted, so gate on the same
+                // predicate it gates on.
+                if (loan.held() && strata::program::serve_swap::swap_needed(mounted_id, R.id)) {
+                    if (ReqCtx* H = ctx_of(loan.owner)) H->loan_held = false;
+                    loan.release(loan.owner);
+                    clear_deferred();
+                }
+                // S3.6: the slot about to be saved is the one the session reflects, NOT the one being
+                // picked.  A decoder has a branch the cache can take - its own consumed token list,
+                // the same list `finish_request` swaps into `live` - but until now nothing published
+                // it mid-request, so `park_current`'s `live_ok` guard refused every pre-emption for a
+                // reason that had nothing to do with the budget.  Publish it before asking.
+                // S3.8: `publish_working_branch` covers the mid-PROMPT case too, which is what makes
+                // two concurrent prefills parkable instead of restarting each other forever.
+                if (ReqCtx* OUT = ctx_of(mounted_id)) {
+                    publish_working_branch(*OUT);
+                    // And re-classify what losing the session would cost it, from the cursor it has
+                    // NOW.  `working_set` was last armed before its previous step, so a read that has
+                    // since consumed tokens would still be classified `re_readable` - and that
+                    // classification is what licenses throwing the read away.
+                    working_set(OUT->id, drv::outgoing_for(OUT->phase, OUT->at));
+                }
+                bool poisoned = false;
+                if (serve_trace)
+                    std::fprintf(stderr, "strata serve: trace: swap slot %lld -> %lld why=%s\n",
+                                 (long long) mounted_id, (long long) R.id, why);
+                const bool had_image = mount_image != std::nullopt;
+                if (swap_to(R.id, serr, poisoned, /*restore_positions=*/true)) {
+                    ++swaps_done;
+                    // S3.6: a re-mount is an EVENT.  Until now the only trace of one was a
+                    // suspiciously large `N reused` figure on the request's summary line, which is
+                    // exactly how the premature-end bug hid for a whole run.
+                    if (had_image && swap_restored)
+                        std::fprintf(stderr, "%s\n", drv::resumed_line(R.id, (int64_t) live.size()).c_str());
+                    // S3.6: the session now holds this slot's branch.  Put `consumed` back in step
+                    // with it (the penalty history and `finish_request` both read it), and mark the
+                    // outgoing slot's context as no longer described by the session unless its state
+                    // was saved.
+                    restore_published_branch(R);
+                    std::lock_guard<std::mutex> lk(slot_mu);
+                    slots_reg.set_active(R.id);
+                    return drv::SwapResult::mounted;
+                }
+                // S3.6: the outgoing slot could not be saved and it still has work to do.  That is NOT
+                // the case the "retry without a restore" recovery below is for - a retry would destroy
+                // the outgoing conversation, which is the bug.  The session is untouched either way.
+                if (swap_park_refused) {
+                    return_mount_image();
+                    if (swap_park_kind == strata::program::serve_swap::ParkRefusal::not_saveable) {
+                        // Transient: the running request has not finished its read, so there is no
+                        // whole branch to save.  It will have one the moment its read ends, so this
+                        // request waits rather than being punished for a race that resolves itself.
+                        std::fprintf(stderr, "%s\n", drv::trace_park_wait(R.id, mounted_id).c_str());
+                        return drv::SwapResult::wait_park;
+                    }
+                    std::fprintf(stderr, "strata serve: swap to slot %lld refused for good (%s) - that request "
+                                         "is ended, the mounted slot keeps the session\n",
+                                 (long long) R.id, serr.c_str());
+                    return drv::SwapResult::end_incoming;
+                }
+                if (!poisoned && !swap_wrote_session && mount_image != std::nullopt) {
+                    // The incoming image was rejected (or the save refused) BEFORE anything was
+                    // written.  S3.1d's own request-line call site handles that by dropping the image
+                    // and handing over WITHOUT a restore - the same answer 0.1.30 gives for an invalid
+                    // snapshot: fall back to re-reading.  Doing it here, inside the one call the driver
+                    // makes, keeps the driver from having to re-derive S3.1d's recovery at the call
+                    // site (which the phase contract forbids).
+                    std::fprintf(stderr, "strata serve: swap: slot %lld -> %lld retried without a restore (%s)\n",
+                                 (long long) mounted_id, (long long) R.id, serr.c_str());
+                    return_mount_image();
+                    poisoned = false;
+                    serr.clear();
+                    if (swap_to(R.id, serr, poisoned, /*restore_positions=*/true)) {
+                        ++swaps_done;
+                        restore_published_branch(R);
+                        std::lock_guard<std::mutex> lk(slot_mu);
+                        slots_reg.set_active(R.id);
+                        return drv::SwapResult::mounted;
+                    }
+                    // S3.6: the retry can hit the same parking guard.  Same two answers, same rule:
+                    // never destroy the outgoing conversation to let a second request in.
+                    if (swap_park_refused) {
+                        return_mount_image();
+                        return swap_park_kind == strata::program::serve_swap::ParkRefusal::not_saveable
+                                   ? drv::SwapResult::wait_park
+                                   : drv::SwapResult::end_incoming;
+                    }
+                }
+                if (poisoned || swap_wrote_session) {
+                    // 0.1.30's rule, kept verbatim: a restore that failed mid-write is fatal to the
+                    // session, and a hand-over that already wrote it must not be retried.
+                    std::printf("%s\n", sp_out.err("slot hand-over failed after the restore: " + serr, R.id).c_str());
+                    std::fflush(stdout);
+                    std::fflush(stderr);
+                    return drv::SwapResult::fatal;
+                }
+                // Refused BEFORE anything was written (R7 exclusivity, a failed drain, a failed save):
+                // the session is intact.  Do not run this slot's step; let the pick try something else.
+                // And give the image back: `mount_image` is a hole in the cache, and leaving it out
+                // would (a) lose the conversation if the process then exited and (b) let the NEXT
+                // hand-over - to a DIFFERENT slot - restore this slot's state into the session.
+                return_mount_image();
+                std::fprintf(stderr, "strata serve: swap to slot %lld refused (%s) - trying other work\n",
+                             (long long) R.id, serr.c_str());
+                return drv::SwapResult::wait_park;
+            };
+            // A driver-level tie-break over `pick()`: the longest-waiting runnable slot that is NOT
+            // deferred.  `pick()` cannot know about the loan (it is engine state, not registry state),
+            // so without this the loop would re-pick the blocked slot forever and the holder - a later
+            // row in the registry's fixed array - would never get the session.  That is a livelock, and
+            // it is the one thing a one-thread scheduler must never do.
+            auto pick_unblocked = [&](int64_t now) -> strata::program::slot::Pick {
+                strata::program::slot::Pick p;      // idle
+                std::lock_guard<std::mutex> lk(slot_mu);
+                const int64_t act = slots_reg.active_id();
+                int64_t best = proto::kNoId, bw = -1;
+                slots_reg.each([&](const strata::program::slot::Slot& s) {
+                    if (s.state != SState::prefilling && s.state != SState::decoding &&
+                        s.state != SState::cancelling) return;
+                    if (is_deferred(s.id)) return;
+                    const int64_t w = slots_reg.waited_ms(now, s);
+                    if (w > bw) { bw = w; best = s.id; }
+                });
+                if (best == proto::kNoId) return p;
+                p.action = (best == act) ? PAct::run : PAct::swap;
+                p.id = best;
+                if (const strata::program::slot::Slot* s = slots_reg.find(best)) p.state = s->state;
+                p.waited_ms = bw > 0 ? bw : 0;
+                p.why = "driver-loan-tiebreak";
+                if (serve_trace) std::fprintf(stderr, "%s\n", drv::trace_pick("tiebreak", p).c_str());
+                return p;
+            };
+            // ---- run ONE step of ONE slot ------------------------------------------------------
+            // `why` is `Pick::why` (or "pending-admit"), kept only for the trace line: the scheduler's
+            // reason for choosing this slot was already computed by `pick()` and thrown away, which is
+            // why a live log could not answer "why THAT slot and not this one".
+            auto run_one = [&](ReqCtx& R, DStep s, const char* why) {
+                req_id = R.id;
+                arm_prompt_view(R);
+                // S3.6 — THE STEP GATE (§5.3, the assertion the contract demands).  A slot may only
+                // step when the mounted session still describes it.  `R.session_valid` is that fact;
+                // `swap_to` clears it for a slot whose session went to somebody else without a
+                // restore, and `prep_request` / a restoring hand-over set it back.  After the parking
+                // guard this should be unreachable for a decode slot, so it is the net under the
+                // guard rather than the guard itself - but the failure it catches is silent garbage,
+                // so it stays armed.
+                {
+                    // `resumable` is the contract's predicate (`invalidate_unparked` is the only thing
+                    // that clears it); `session_valid` catches the other half - a slot the session was
+                    // moved away from without a restore, whose record the adopt hook still calls
+                    // resumable.  Either one being false means the session does not describe this slot.
+                    R.session_valid = (R.id == mounted_id) && session_established;
+                    const drv::Gate g = drv::step_gate(R.phase, conv_of(R.id).resumable,
+                                                       R.session_valid);
+                    if (g == drv::Gate::end) {
+                        std::fprintf(stderr, "strata serve: slot %lld would step in %s with no conversation "
+                                             "to step against - ending it (stage 3 §5.3)\n",
+                                     (long long) R.id, drv::phase_name(R.phase));
+                        std::fflush(stderr);
+                        if (R.loan_held) { loan.release(R.id); R.loan_held = false; clear_deferred(); }
+                        // S3.7: the reason names the state it found, and for the decode case it quotes
+                        // the two numbers that decided it - the size this slot's last parked image
+                        // actually was (or the last refused save would have needed) and the budget in
+                        // force.  The old text blamed "the parking budget is too small" for every
+                        // variant of this, including the ones with a 9 GiB budget, which sent the owner
+                        // to raise a knob that was not the problem.
+                        drv::GateEnd ge;
+                        ge.ph = R.phase;
+                        ge.resumable = conv_of(R.id).resumable;
+                        ge.session_valid = R.session_valid;
+                        const int64_t pb = conv_of(R.id).parked_bytes;
+                        ge.snapshot_bytes = (uint64_t) (pb > 0 ? pb : (int64_t) swap_park_snapshot);
+                        ge.budget_bytes = (uint64_t) conversations.budget();
+                        end_slot(R.id, drv::gate_end_reason(ge));
+                        drop_ctx(R.id);
+                        return;
+                    }
+                    if (g == drv::Gate::re_read) {
+                        // S3.8 — THE PROMISE, KEPT, AND BOUNDED.  A re-read is an honest recovery the
+                        // first time a branch is lost.  Repeated, it is the two-prefill livelock the
+                        // owner hit: slot 3 was reset to token 0 101 times and never finished, because
+                        // a mid-prompt read was classified `re_readable` and never published, so every
+                        // swap erased it.  `outgoing_for` now calls such a slot `must_park`, which
+                        // removes the mechanism; this bound is the net under it, and it turns any
+                        // remaining spin into a named ERR instead of an infinite re-read.
+                        ++R.rereads;
+                        if (!drv::reread_allowed(R.rereads)) {
+                            std::fprintf(stderr, "strata serve: %s\n",
+                                         drv::reread_limit_line(R.id, R.rereads, drv::kMaxRereads).c_str());
+                            std::fflush(stderr);
+                            if (R.loan_held) { loan.release(R.id); R.loan_held = false; clear_deferred(); }
+                            end_slot(R.id, drv::reread_limit_line(R.id, R.rereads, drv::kMaxRereads));
+                            drop_ctx(R.id);
+                            return;
+                        }
+                        // THE PROMISE, KEPT.  This slot lost its session state and survives, so it
+                        // really does go back to token 0: phase, cursor, segments, checkpoints and the
+                        // resume resolution all reset.  `prep_request` already ran, so its sampling
+                        // dispatch and its position table are still in `R`; what has to be rebuilt is
+                        // the session and everything that reads where the prompt starts.
+                        std::fprintf(stderr, "%s\n", drv::reread_line(R.id, R.n).c_str());
+                        std::fflush(stderr);
+                        reset_request_to_token0(R);
+                    }
+                }
+                // S3.6: the driver's view of what losing the session would cost this slot.  Refreshed
+                // from the phase before every step, which is what `swap_to`'s parking guard reads.
+                // S3.8: and from the CURSOR, because a prefill that has already read tokens has
+                // progress the cache can save - classifying it `re_readable` is what let every swap
+                // erase it and send it back to token 0 forever.
+                working_set(R.id, drv::outgoing_for(R.phase, R.at));
+                if (serve_trace)
+                    std::fprintf(stderr, "%s\n", drv::trace_step(R.id, s, why).c_str());
+                const drv::Phase phase_before = R.phase;
+                // A STOP that arrived between requests is stale, exactly as the serial path cleared it
+                // at the top of its iteration.  The per-slot `cancel` flag is what carries the intent
+                // now: the stdin thread sets both, and `stopped()` reads the slot's.
+                stop_req.store(false);
+                {
+                    std::lock_guard<std::mutex> lk(slot_mu);
+                    running_id.store(R.id);
+                }
+                const int64_t t0 = drv::now_ms();
+                bool ran = true;
+                // Was THIS slot STOPped?  `dispatch_step` already turned that into "run the phase's
+                // tail, never a new step"; the two tail branches need the same answer to record why
+                // the request ended (`cancel`) and whether the conversation state may be updated.
+                bool unwinding = false;
+                {
+                    std::lock_guard<std::mutex> lk(slot_mu);
+                    if (const strata::program::slot::Slot* sl = slots_reg.find(R.id))
+                        unwinding = sl->cancel.load();
+                }
+                {
+                    // 0.1.30's SlotGuard, plus `finished`: armed per step, it releases the row only
+                    // when the request actually ended.  Same destructor order (mrope, then slot).
+                    struct StepGuard {
+                        ReqCtx* ctx = nullptr;
+                        std::function<void(int64_t)> finish;
+                        ~StepGuard() { if (ctx && ctx->slot_open && ctx->finished && finish) finish(ctx->id); }
+                    } step_guard{&R, std::function<void(int64_t)>(slot_finish)};
+                    MropeScope mrope_scope;
+                    mrope_scope.skip = [&]() { return !swaps_on || !R.mrope_touched || mounted_id == req_id; };
+                    mrope_scope.restore = [&]() {
+                        if (mounted_id == strata::program::serve_proto::kNoId) return;
+                        apply_positions(conv_of(mounted_id));
+                        if (!mrope_host.empty()) upload_mrope_table();
+                        mrope_owner = mounted_id;
+                    };
+                    watch_begin(R.id);
+                    if (s == DStep::admit) {
+                        const Prep pr = prep_request(R, R.line);
+                        R.has_line = false;
+                        if (pr == Prep::ok) {
+                            plan_prompt_segments(R);
+                            R.phase = drv::Phase::prefill;
+                            R.pp_total = pp_total; R.pp_from = pp_from;
+                            R.pp_t0 = pp_t0; R.pp_next_check = pp_next_check;
+                            bool cancel_now = false;
+                            {
+                                std::lock_guard<std::mutex> lk(slot_mu);
+                                if (const strata::program::slot::Slot* sl = slots_reg.find(R.id))
+                                    cancel_now = sl->cancel.load();
+                                if (strata::program::slot::Slot* sl = slots_reg.find(R.id)) sl->started_ms = t0;
+                                slots_reg.set_active(R.id);   // §5.3: the session now reflects this slot
+                            }
+                            if (cancel_now) {
+                                // `STOP <id>` arrived before this line did, so the row was cancelled at
+                                // admission and `slot_step` already moved it to `cancelling`.  Skip the
+                                // read entirely and go to the prefill tail: `finish_prefill` reports
+                                // `cancel`, and `finish_request` leaves `live` alone because
+                                // `R.cancelled` is set.  Running the read anyway would leave the
+                                // conversation state claiming a prompt the session never consumed.
+                                R.cancelled = true;
+                                R.phase = drv::Phase::prefill_end;
+                            }
+                            ++admitted;
+                        } else if (pr == Prep::rejected) {
+                            R.finished = true;                // the guard releases the row
+                        } else {
+                            R.fail = 1;
+                        }
+                    } else if (s == DStep::prefill) {
+                        arm_prompt_state(R);
+                        // What THIS segment will do, decided exactly as `run_prefill_step` decides it:
+                        //   `through_windows` -> it calls `refill` first (the loan goes back);
+                        //   `batched`         -> it calls `lend` (the loan is taken);
+                        //   neither (no segment left) -> it touches nothing and returns `finished`.
+                        // The driver's loan view has to follow that, or a slot that still physically
+                        // holds the loan would let a second slot lend the same cache rows (risk R8).
+                        const int64_t to = next_segment_end(R);
+                        const bool has_seg = to > R.at;
+                        const bool through_windows = has_seg && windows_ok(R.at, to);
+                        const bool batched = has_seg && !through_windows;
+                        if (batched && !loan.acquire(R.id)) {
+                            // R8's hard guard.  The loop defers a slot before it gets here, so this
+                            // should be unreachable; it stays because "two slots lent the same cache
+                            // rows" is silent and produces plausible tokens, and a guard that cannot
+                            // be bypassed is worth more than one that relies on the caller.
+                            std::fprintf(stderr, "strata serve: slot %lld could not take the prompt loan "
+                                                 "(held by slot %lld) - step skipped\n", (long long) R.id,
+                                         (long long) loan.owner);
+                            ran = false;
+                        } else {
+                            if (batched) R.loan_held = true;   // taken by the guard above
+                            const Step r = run_prefill_step(R);
+                            R.pp_next_check = pp_next_check;
+                            if (through_windows && R.loan_held) {
+                                // The segment refilled before it read (0.1.30's `if (win &&
+                                // !refill(err))`), so a loan this slot held from an earlier batched
+                                // segment is gone.
+                                loan.release(R.id); R.loan_held = false;
+                                if (!loan.held()) clear_deferred();
+                            } else if (batched && R.loan_held) {
+                                loan.acquire(R.id);   // still ours: the sticky loan keeps the layout
+                            }
+                            if (r == Step::progressed) R.phase = drv::Phase::prefill;
+                            else if (r == Step::finished || r == Step::cancelled) R.phase = drv::Phase::prefill_end;
+                            else if (r == Step::needs_swap) R.phase = drv::Phase::prefill;
+                            else if (r == Step::error) R.fail = 1;
+                            else if (r == Step::fatal_exit) R.fail = 2;
+                        }
+                    } else if (s == DStep::prefill_end) {
+                        arm_prompt_state(R);
+                        // A between-steps cancel that skipped the remaining segments is the same
+                        // situation as a cancel caught inside `run_prefill_step`: the prompt was not
+                        // read to the end, so the session sits between two chunks and `live` must not
+                        // be swapped.  `finish_prefill` turns `cancelled` into `DONE ... cancel`.
+                        if (unwinding && R.phase == drv::Phase::prefill) R.cancelled = true;
+                        const Step r = finish_prefill(R);   // this is the call that refills the loan
+                        if (R.loan_held) { loan.release(R.id); R.loan_held = false; }
+                        if (r == Step::error) R.fail = 1;
+                        else R.phase = drv::Phase::decode;
+                        if (!loan.held()) clear_deferred();   // the waiters can go now
+                    } else if (s == DStep::decode) {
+                        if (loan.held()) {
+                            // A verify window may not read over a lent cache: `refill` puts the expert
+                            // rows back.  Normally the hand-over's return_loan step already did this;
+                            // it is belt-and-braces so a window can never see a lent slot.
+                            if (!refill(err)) {
+                                std::printf("%s\n", sp_out.err("refilling a lent slot failed: " + err, R.id).c_str());
+                                std::fflush(stdout);
+                                err.clear();
+                                R.fail = 1;
+                            } else {
+                                for (ReqCtx& Q : live) Q.loan_held = false;
+                                loan.release(loan.owner);
+                                clear_deferred();
+                            }
+                        }
+                        if (ran) {
+                            const Step r = run_decode_step(R);
+                            if (r == Step::progressed) R.phase = drv::Phase::decode;
+                            else if (r == Step::finished || r == Step::cancelled) R.phase = drv::Phase::done;
+                            else if (r == Step::error) R.fail = 1;
+                            else if (r == Step::fatal_exit) R.fail = 2;
+                        }
+                    } else if (s == DStep::finish || s == DStep::unwind) {
+                        // A slot cancelled BETWEEN steps never ran the window that would have set
+                        // `finish = "cancel"` (`run_decode_step`'s `if (stopped())`).  Say the same
+                        // thing, but only when the slot still had work left: a request that reached
+                        // max_new or EOS keeps 0.1.30's "length"/"stop".  `R.cancelled` stays as it is
+                        // on purpose - a decode-time cancel still records the tokens it produced
+                        // (0.1.30's rule: only a prefill-time cancel sets it, and only then is `live`
+                        // left alone).
+                        if (unwinding && R.phase == drv::Phase::decode) R.finish = "cancel";
+                        const Step r = finish_request(R);
+                        if (r == Step::error) R.fail = 1;
+                        else { R.phase = drv::Phase::done; R.finished = true; }
+                    }
+                    watch_idle(R.id);
+                }   // ~MropeScope, then ~StepGuard - the serial path's order, one step at a time
+                // `note_ran` is the fairness clock AND the watchdog's per-slot heartbeat.  A step that
+                // did not run must NOT reset it, or a deferred slot would look served forever.
+                if (ran) {
+                    const int64_t t1 = drv::now_ms();
+                    std::lock_guard<std::mutex> lk(slot_mu);
+                    slots_reg.note_ran(R.id, t1, t1 > t0 ? t1 - t0 : 0);
+                    ++steps_run;
+                }
+                // S3.6: the phase transition, as its own event.  The registry's SLOT line reports the
+                // state machine's shape; this reports the DRIVER's, which is the one that decides what
+                // step runs next, and it is the line that shows a slot going backwards to `prefill`
+                // because it lost its state and is re-reading.  Read BEFORE `drop_ctx`, which destroys
+                // the context this reference points into.
+                const drv::Phase phase_after = R.phase;
+                if (serve_trace) {
+                    const std::string tl = drv::trace_phase(R.id, phase_before, phase_after,
+                                                            R.finished ? "request ended" : "step result");
+                    if (!tl.empty()) std::fprintf(stderr, "%s\n", tl.c_str());
+                }
+                if (R.finished) {
+                    {
+                        // `slot_finish` cleared the registry's active id; the SESSION still reflects
+                        // this conversation until the next hand-over, so put the two back in step.
+                        std::lock_guard<std::mutex> lk(slot_mu);
+                        slots_reg.set_active(mounted_id);
+                    }
+                    // S3.6: a request that is over no longer needs its state saved, so a later
+                    // hand-over away from it is never refused for its sake.  `drop_ctx` removes the
+                    // entry too; this makes the answer correct in the window between the step that
+                    // ended the request and the one that frees the row.
+                    working_set(R.id, strata::program::serve_swap::Outgoing::finished);
+                    drop_ctx(R.id);
+                }
+            };
+            // ---- the loop ----------------------------------------------------------------------
+            // S3.6 — CATCH THE PARKING BUDGET AT ADMISSION, not 97 seconds later.
+            //
+            // `parking_off_refuses_slots` already refuses `--serve-slots >= 2` when the cache is off.
+            // The owner's box was the next case, and the one that actually bit: a budget of 2 GiB is
+            // not zero, so it passed every existing check - but a conversation at this
+            // --max_context needs a snapshot of ~3.4 GiB, so it could NEVER be parked, and the
+            // engine discovered that mid-decode by destroying the conversation.  Size the worst case
+            // here, with the engine's own sizing call, and say what concurrency is actually possible
+            // on this machine before the first request arrives.
+            //
+            // S3.7: `ceiling` (declared above, where `admit_one` can read it) is filled here.  It is
+            // also the FALLBACK price of one slot for RAM admission - the per-token rate it implies is
+            // what a request is charged against until a real park has been measured - so it has to be
+            // computed before the driver line that reports it and before the first request is admitted.
+            {
+                ceiling.budget_bytes = conversations.budget();
+                ceiling.slots = conversations.slots();
+                ceiling.size_at((uint64_t) o.max_context);
+                // The largest branch the session could ever be asked to save: every cell of the
+                // context, no checkpoints (the chain only adds to the figure, so this is a floor of
+                // the worst case, which is the honest number to quote).
+                std::vector<int32_t> worst((size_t) o.max_context, 0);
+                std::vector<ImgKey> no_imgs;
+                std::vector<ConvCheckpoint> no_checks;
+                const strata::core::ConversationView view{worst, no_imgs, no_checks, cvec_cached};
+                std::string cerr;
+                if (strata::core::conversation_snapshot_bytes(view, ss, conv_stages, g, mtp.kv_state(),
+                                                              ceiling.snapshot_bytes, cerr))
+                    ceiling.sized = true;
+                else
+                    std::fprintf(stderr, "strata serve: could not size a worst-case snapshot at "
+                                         "--max_context %lld (%s) - the parking-budget admission check "
+                                         "is skipped\n", (long long) o.max_context, cerr.c_str());
+            }
+            std::fprintf(stderr, "%s\n", drv::driver_line(slots, o.starve_ms, swaps_on,
+                                                          conversations.budget(), conversations.slots(),
+                                                          ceiling.per_token(), o.decode_tokens).c_str());
+            {
+                const drv::ParkCeiling& ceil = ceiling;
+                if (ceil.sized && ceil.useless_budget())
+                    std::fprintf(stderr, "%s\n", drv::park_ceiling_line(slots, ceil, driver_on).c_str());
+                else if (ceil.sized)
+                    // S3.7: quote the RATE as well as the worst case. `budget / max_context` is the
+                    // only per-token figure the engine has before anything has been parked, and it is
+                    // what makes the answer to "does a short conversation cost less?" concrete: yes,
+                    // proportionally, and this is the proportion.
+                    std::fprintf(stderr, "strata serve: a conversation at this --max_context parks in "
+                                         "%lld MiB, and the budget is %lld MiB - up to %d such "
+                                         "conversation(s) can be swapped. A parked conversation costs "
+                                         "about %lld B per context token, so a shorter one costs "
+                                         "proportionally less; nothing is reserved per slot.\n",
+                                 (long long) (ceil.snapshot_bytes >> 20),
+                                 (long long) (ceil.budget_bytes >> 20), ceil.capacity(),
+                                 (long long) ceil.per_token());
+                std::fflush(stderr);
+            }
+            // S3.4's `/status` and `/metrics` need the number the serial INFO line can only state once
+            // (it is printed before any request exists).  The driver reports it again, live, on stderr
+            // every time the active set changes, so the Monitor tab can show N conversations without a
+            // new wire line.  stdout is untouched: §6.1's rule is that the SLOT line carries state.
+            std::fflush(stderr);
+            int last_active = -1, peak_active = 0;
+            auto report_active = [&]() {
+                std::lock_guard<std::mutex> lk(slot_mu);
+                const int a = slots_reg.active_count();
+                if (a > peak_active) peak_active = a;
+                if (a == last_active) return;
+                last_active = a;
+                std::fprintf(stderr, "strata serve: slots=%d slots_active=%d swaps=%lld swap_ms=%lld\n",
+                             slots, a, (long long) slots_reg.swaps(), (long long) slots_reg.swap_ms());
+                std::fflush(stderr);
+            };
+            // S3.6: the PERIODIC activity line.  `report_active` above only fires when the active set
+            // CHANGES, so a run where two conversations were genuinely interleaved and a run that
+            // never got past one look identical in the log - the only difference is the ABSENCE of a
+            // line, which is the least greppable fact there is.  This one is on a time bound and
+            // carries the peak, so `peak=1` vs `peak=2` is a positive statement about the run.
+            const int64_t activity_every_ms = [] {
+                if (const char* v = std::getenv("STRATA_SERVE_ACTIVITY_S")) {
+                    const int n = std::atoi(v);
+                    return n <= 0 ? (int64_t) 0 : (int64_t) n * 1000;
+                }
+                return (int64_t) 30000;   // 30 s: cheap, and far below any interesting request
+            }();
+            int64_t next_activity_ms = drv::now_ms() + activity_every_ms;
+            auto report_activity = [&]() {
+                if (activity_every_ms <= 0) return;
+                const int64_t now = drv::now_ms();
+                if (now < next_activity_ms) return;
+                next_activity_ms = now + activity_every_ms;
+                int a = 0;
+                {
+                    std::lock_guard<std::mutex> lk(slot_mu);
+                    a = slots_reg.active_count();
+                    if (a > peak_active) peak_active = a;
+                }
+                std::fprintf(stderr, "%s\n",
+                             drv::activity_line(slots, a, peak_active, (long long) slots_reg.swaps(),
+                                                (long long) slots_reg.swap_ms(), steps_run, admitted,
+                                                refused, conversations.size(), conversations.bytes(),
+                                                conversations.budget(), holds.line(now)).c_str());
+                std::fflush(stderr);
+            };
+            struct DriverBusy {
+                DriverBusy() { strata::core::progress().busy.store(true); strata::core::progress_at("request"); }
+                ~DriverBusy() { strata::core::progress().busy.store(false); strata::core::progress_at("idle"); }
+                void off() { strata::core::progress().busy.store(false); strata::core::progress_at("idle"); }
+                void on() { strata::core::progress().busy.store(true); strata::core::progress_at("request"); }
+            } busy_scope;
+            while (!driver_quit && !driver_fatal) {
+                // Progress for THIS pass.  A pass that changes nothing (a refused hand-over, a cap
+                // that has not freed, a pick that keeps choosing a slot that cannot run) must never
+                // become a CPU spin, so the pass that follows a still one sleeps first.  It is checked
+                // at the TOP because every no-progress path `continue`s: a check at the bottom of the
+                // body would be unreachable.  This is a backstop, not the mechanism - the mechanisms
+                // are the deferral queue and `pick_unblocked` - because a scheduler with several
+                // independent reasons to skip a step is exactly where a per-reason fix misses one.
+                if (!pass_moved) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                pass_moved = false;
+                // 1. the watchdog's verdicts first (R3): they free permits and change what is pickable.
+                for (;;) {
+                    int64_t kid = proto::kNoId;
+                    {
+                        std::lock_guard<std::mutex> lk(watch_mu);
+                        if (!watch_kill.empty()) { kid = watch_kill.front(); watch_kill.pop_front(); }
+                    }
+                    if (kid == proto::kNoId) break;
+                    kill_slot(kid);
+                    pass_moved = true;
+                }
+                // 2. admit, bounded by the cap and by RAM.  One admission per pass, so a burst of lines
+                //    cannot starve the slots already running.
+                admit_one();
+                if (driver_quit) break;
+                // 2a. S4.2 "hold, don't reject": the queue's deadlines first (an expired wait is an
+                //     honest ERR that names what it waited for), then let the head through if the
+                //     resource it waited for has come back.  Rate-limited, because the pass loop runs
+                //     thousands of times a second and re-asking means reading /proc's free RAM.
+                if (!holds.empty()) {
+                    expire_waiters();
+                    const int64_t nownow = drv::now_ms();
+                    if (nownow >= next_promote_ms) {
+                        next_promote_ms = nownow + 20;
+                        promote_waiters();
+                    }
+                    report_waits();
+                }
+                report_active();
+                report_activity();
+                // 2b. bring a pending request in, as its own step.  This is §3.1's "drain the request
+                // queue; admit/refuse", and it is a STEP: `prep_request` mounts, dispatches sampling
+                // and can take tens of milliseconds, so it must not be smuggled into another slot's
+                // step.  It only runs when a permit is actually free, so the transition to
+                // `prefilling` inside `prep_request` cannot be refused.
+                if (ReqCtx* P = pending_ctx()) {
+                    bool free_permit = false;
+                    {
+                        std::lock_guard<std::mutex> lk(slot_mu);
+                        free_permit = slots_reg.can_admit();
+                    }
+                    if (free_permit) {
+                        pass_moved = true;
+                        // S3.6: `prep_request` owns the REQUEST-LINE hand-over, and it cannot publish
+                        // the outgoing slot's branch itself - at the point its body was written the
+                        // driver's `live` deque does not exist yet, so the name `live` inside it is the
+                        // serve-scope token vector.  Publish here, before the admit step, or the
+                        // parking guard sees a mid-decode slot with nothing to save and refuses a
+                        // hand-over that would otherwise have been perfectly parkable - turning a new
+                        // client's first request into an ERR.  S3.8: a mid-PROMPT slot needs the same
+                        // publish, or the admit step's hand-over erases its read.
+                        if (ReqCtx* OUT = ctx_of(mounted_id)) {
+                            publish_working_branch(*OUT);
+                            working_set(OUT->id, drv::outgoing_for(OUT->phase, OUT->at));
+                        }
+                        const int64_t pid = P->id;      // `run_one` may drop the context (a rejected
+                        run_one(*P, drv::Step::admit, "pending-admit");  // prep), so the id is
+                        ReqCtx* A = ctx_of(pid);
+                        if (A != nullptr) {
+                            if (A->fail == 2) { std::fflush(stdout); std::fflush(stderr); std::_Exit(1); }
+                            if (A->fail == 1) { driver_fatal = true; break; }
+                        }
+                        continue;
+                    }
+                }
+                // 3. pick.
+                const int64_t now = drv::now_ms();
+                strata::program::slot::Pick p;
+                {
+                    std::lock_guard<std::mutex> lk(slot_mu);
+                    p = slots_reg.pick(now);
+                }
+                if (serve_trace)
+                    std::fprintf(stderr, "%s\n", drv::trace_pick("registry", p).c_str());
+                if (p.action == PAct::idle) {
+                    // Nothing runnable.  A line already in hand that admission deferred (the cap, an
+                    // image request holding the position table) is handled by the pass-level backstop
+                    // above, so just wait for the next line here.  Release the watchdog's "busy" while
+                    // blocked, exactly as 0.1.30's BusyScope did between iterations.
+                    busy_scope.off();
+                    // S3.2b: the engine is idle, the GPU is free, and the caches may be missing rows the
+                    // last prompt left out.  Walk them home for a bounded moment before blocking on stdin,
+                    // so the next request's decode starts from a warmer cache.  Bounded because this same
+                    // thread is the one that has to notice an arriving request - and `line_waiting()` lets
+                    // the drain stop early when one has.
+                    drain_loans_idle(250, [&]() {
+                        std::lock_guard<std::mutex> lk(in_mu);
+                        return !in_lines.empty() || in_eof;
+                    });
+                    const bool got = !held_line.empty() || next_line(held_line);
+                    busy_scope.on();
+                    if (!got) break;
+                    pass_moved = true;   // a real line arrived: admit it on the next pass, no sleep
+                    continue;
+                }
+                if ((p.action == PAct::run || p.action == PAct::swap) && is_deferred(p.id)) {
+                    const strata::program::slot::Pick q = pick_unblocked(now);
+                    if (q.action != PAct::idle) p = q;
+                    else {
+                        // Everything runnable is waiting for the loan and its holder is not runnable.
+                        // Yield rather than spin; the holder becomes runnable on the next pass.
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        continue;
+                    }
+                }
+                ReqCtx* R = ctx_of(p.id);
+                if (R == nullptr) {
+                    // A row with no context: its request was refused or finished and its release was
+                    // missed.  Say so loudly and free the permit - a stranded permit is the one bug that
+                    // would deadlock admission, because the permit IS the bound on everything else.
+                    std::fprintf(stderr, "strata serve: slot %lld picked with no request context - releasing it\n",
+                                 (long long) p.id);
+                    end_slot(p.id, "internal: this request's slot lost its state and was released");
+                    watch_forget(p.id);
+                    pass_moved = true;
+                    continue;
+                }
+                // 4. fairness (OQ4).  `pick()` bounds a SWAP by --starve-ms; what only the driver can
+                //    see is a slot that stays pickable but never gets served (the loan, a refused
+                //    hand-over, a cap that never frees).  A real wedge is caught by the watchdog (the
+                //    heartbeat freezes and every watched slot stalls with it), so here the bound only
+                //    reports: killing a slot that is fairly waiting behind a 36 k-token read would be
+                //    worse than the bug it guards against.
+                if (drv::slot_starved_to_death(p.waited_ms, (int64_t) watchdog_limit_s * 1000)) {
+                    static int64_t last_warn_ms = 0;
+                    if (now - last_warn_ms >= 10000) {
+                        last_warn_ms = now;
+                        std::fprintf(stderr, "strata serve: slot %lld has waited %lld ms for the GPU "
+                                             "(starve bound %lld ms, %lld slot(s) deferred on the prompt "
+                                             "loan)\n", (long long) p.id, (long long) p.waited_ms,
+                                     (long long) o.starve_ms, (long long) deferred.size());
+                    }
+                }
+                // 5. dispatch.  R8 is asked FIRST, before the hand-over: a swap is a full
+                //    save+restore (R10), so moving the session to a slot only to discover it cannot
+                //    lend, then moving it back next pass, is exactly the swap churn the design refuses.
+                //    The question is about the step the slot would ACTUALLY run, so a cancelled slot
+                //    (whose dispatch is the phase tail, which never lends) is never parked behind a
+                //    loan it does not need.
+                arm_prompt_view(*R);
+                DStep s = drv::dispatch_step(p, R->phase);
+                const bool next_lends = (s == DStep::prefill || s == DStep::swap) &&
+                                        R->phase == drv::Phase::prefill && segment_needs_loan(*R);
+                if (next_lends && !loan.may_lend(R->id)) {
+                    if (!is_deferred(R->id)) {
+                        deferred.push_back(R->id);
+                        ++deferred_hits;
+                        std::fprintf(stderr, "strata serve: slot %lld waits for the prompt loan "
+                                             "(held by slot %lld)\n", (long long) R->id,
+                                     (long long) loan.owner);
+                        if (serve_trace)
+                            std::fprintf(stderr, "%s\n", drv::trace_loan_defer(R->id, loan.owner).c_str());
+                    }
+                    continue;
+                }
+                if (is_deferred(R->id)) un_defer(R->id);
+                if (s == DStep::swap) {
+                    req_id = R->id;      // `swap_to`'s own messages name the request it is moving to
+                    std::string serr;
+                    const drv::SwapResult sr = do_swap(*R, serr, p.why);
+                    if (sr == drv::SwapResult::fatal) { driver_fatal = true; break; }
+                    if (sr == drv::SwapResult::end_incoming) {
+                        // S3.6: the outgoing conversation can NEVER be parked here.  The incoming
+                        // request gets an ERR naming both numbers and its permit comes back; the
+                        // session was not written, so every other conversation is untouched.
+                        if (R->loan_held) { loan.release(R->id); R->loan_held = false; clear_deferred(); }
+                        end_slot(R->id, serr);
+                        drop_ctx(R->id);
+                        pass_moved = true;
+                        continue;
+                    }
+                    if (sr != drv::SwapResult::mounted) {
+                        // Refused and recoverable later (the running read has not finished, R7's
+                        // exclusivity, a residency drain that failed).  Do NOT end the request and do
+                        // NOT re-pick it this pass: park it behind the mounted slot, exactly like a
+                        // slot parked behind the prompt loan, or the loop spins on the same refusal.
+                        if (!is_deferred(R->id)) { deferred.push_back(R->id); ++deferred_hits; }
+                        continue;
+                    }
+                    if (mounted_id != R->id) {
+                        // The hand-over was refused and the retry without a restore was refused too
+                        // (R7's exclusivity, a residency drain that failed, a snapshot save that
+                        // failed).  That is not transient, and re-picking the slot would spin on the
+                        // same refusal, so this request ends and its permit comes back.  The session
+                        // was not written, so the other conversations are untouched - which is the
+                        // whole point of validating before saving (S3.1d).
+                        std::fprintf(stderr, "strata serve: swap to slot %lld failed (%s) - ending that "
+                                             "request; the session was not written\n",
+                                     (long long) R->id, serr.c_str());
+                        if (R->loan_held) { loan.release(R->id); R->loan_held = false; clear_deferred(); }
+                        end_slot(R->id, "slot hand-over failed: " + serr);
+                        drop_ctx(R->id);
+                        continue;
+                    }
+                    strata::program::slot::Pick q;
+                    q.action = PAct::run;
+                    q.id = p.id;
+                    q.state = p.state;
+                    q.waited_ms = p.waited_ms;
+                    q.why = p.why;
+                    s = drv::dispatch_step(q, R->phase);
+                }
+                if (s == DStep::none) continue;
+                pass_moved = true;
+                run_one(*R, s, p.why);
+                // 6. a failure the step could not act on itself (returning from inside a step lambda
+                //    would have skipped the slot's unwind and leaked its permit).
+                ReqCtx* A = ctx_of(p.id);
+                if (A != nullptr) {
+                    if (A->fail == 2) { std::fflush(stdout); std::fflush(stderr); std::_Exit(1); }
+                    if (A->fail == 1) { driver_fatal = true; break; }
+                }
+            }
+            // The engine is ending: give every live slot its answer rather than closing the pipe under
+            // the server, then exit normally.
+            for (ReqCtx& R : live)
+                if (R.slot_open) std::printf("%s\n", sp_out.err("engine shutting down", R.id).c_str());
+            std::fflush(stdout);
+            std::fprintf(stderr, "strata serve: concurrent driver finished: %lld admitted, %lld steps, "
+                                 "%lld swaps, %lld refused, %lld deferred step(s), %lld slot(s) still live\n",
+                         (long long) admitted, (long long) steps_run, (long long) swaps_done,
+                         (long long) refused, (long long) deferred_hits, (long long) live.size());
+            // S3.2b: the loan's process totals.  `handoffs` over `refilled` is the whole point of the lazy
+            // rule - a process that handed the loan between slots many times while refilling few rows is one
+            // that stopped paying the end-of-request refill.  `still out` is what the caches are missing at
+            // the moment the driver stops, which is the honest cost of never having copied them home.
+            if (!pf_parts.empty()) {
+                const std::array<int64_t, 6> t = loan_totals(pf_parts);
+                std::fprintf(stderr, "strata serve: prompt loan totals: %lld lend(s), %lld hand-off(s), "
+                                     "%lld relayout, %lld relayout skipped, %lld grown, %lld rows refilled "
+                                     "eagerly, %lld pumped home, %lld row(s) still out of the caches (%s)\n",
+                             (long long) loan.acquires, (long long) loan.handoffs,
+                             (long long) t[0], (long long) t[1], (long long) t[2], (long long) t[3],
+                             (long long) t[5], (long long) loan_outstanding(pf_parts),
+                             loan_policy.lazy ? "lazy" : "eager");
+            }
+            std::fflush(stderr);
+            return driver_fatal ? 1 : 0;
+        }
+        // ---- S3.1e-2: everything below is 0.1.30's serial driver, unchanged.  The gate above is an
+        // early return, so this loop's text is byte-identical to the pre-S3.1e-2 source.
+        while (next_line(line)) {
+            if (line == "QUIT") break;
+            // the watchdog watches a request from here until this iteration ends, whichever way it ends
+            struct BusyScope {
+                BusyScope() { strata::core::progress().busy.store(true); strata::core::progress_at("request"); }
+                ~BusyScope() { strata::core::progress().busy.store(false); strata::core::progress_at("idle"); }
+            } busy_scope;
+            stop_req.store(false);   // a STOP that arrived between requests is stale
+            ++request_index;         // S0.3 lever 4: the parking backoff's window is in requests
+            err.clear();
+            // S3.1e-1: everything the old body kept as per-request locals.  Constructed here, once per
+            // iteration, so its lifetime is those locals' lifetime.
+            ReqCtx R;
+            // Whatever happens to this request from here - a validation ERR, a body ERR, a normal DONE - its
+            // row is finished at the end of the iteration.  A guard rather than a call at every exit: the loop
+            // has a dozen `continue`s, and a leaked row would strand an active-slot permit, which under
+            // --serve-slots is the resource that bounds everything (§2.3).
+            SlotGuard slot_guard{&R, tagged ? std::function<void(int64_t)>(slot_finish) : nullptr};
+            // S3.1d R7, the guard.  The block below REWRITES the one host table and uploads it, for a
+            // request that may still bail out (a bad embeddings file, a prompt too long for the
+            // context, a token outside the vocabulary).  If it does, the slot that is actually mounted
+            // is left with somebody else's positions in the device - and it is still mounted, so no
+            // hand-over will put them back.  This guard restores the mounted slot's table on the way
+            // out whenever the request did not become the mounted one.  On the normal path the swap
+            // sets `mounted_id == req_id` and the guard does nothing.
+            MropeScope mrope_scope;
+            mrope_scope.skip = [&]() { return !swaps_on || !R.mrope_touched || mounted_id == req_id; };
+            mrope_scope.restore = [&]() {
+                if (mounted_id == strata::program::serve_proto::kNoId) return;
+                apply_positions(conv_of(mounted_id));
+                if (!mrope_host.empty()) upload_mrope_table();
+                mrope_owner = mounted_id;
+            };
+            const Prep prep = prep_request(R, line);
+            if (prep == Prep::rejected) continue;
+            if (prep == Prep::fatal) return 1;
+
+            // ---- S3.1e-1 phase 3: the prompt, one segment per step (0.1.30: one straight-line loop)
+            plan_prompt_segments(R);
+            Step st = Step::progressed;
+            while ((st = run_prefill_step(R)) == Step::progressed) {}
+            if (st == Step::error) return 1;
+            if (st == Step::fatal_exit) {   // #224: a CUDA fault poisons the context for the whole process
+                std::fflush(stdout);
+                std::fflush(stderr);
+                std::_Exit(1);
+            }
+            if (finish_prefill(R) == Step::error) return 1;
+            // ---- S3.1e-1 phase 4: one verify window per step (0.1.30: one straight-line loop)
+            Step dst = Step::progressed;
+            while ((dst = run_decode_step(R)) == Step::progressed) {}
+            if (dst == Step::error) return 1;
+            // ---- S3.1e-1 phase 5: the request's tail (0.1.30: inline at the end of the body)
+            if (finish_request(R) == Step::error) return 1;
         }
         return 0;
     }

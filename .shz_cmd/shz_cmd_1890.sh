@@ -1,0 +1,1 @@
+cd /tmp/s3build; ./serve_driver_test | tail -1; ./serve_swap_test | tail -1; ctest 2>&1 | grep -E "tests passed"; cd /ssd/Strata; cd build && ninja 2>&1 | tail -1; cd /ssd/Strata; timeout 400 python3 -m pytest serve/test_server.py -q 2>&1 | tail -1; python3 .shz_cmd/s31e2_serial_proof.py 2>&1|tail -1; python3 .shz_cmd/s31e2_output_proof.py 2>&1|tail -1

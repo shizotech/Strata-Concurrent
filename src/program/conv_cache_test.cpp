@@ -12,14 +12,20 @@
 //   3. a mount advances a checkpoint's stamp and the rotation then takes a different leaf;
 //   4. a one-slot budget has no room for root and leaf, so the pin is off and the oldest leaves (the
 //      newest point stays, as before);
-//   5. the policy is pure: the same stamps, the same victim.
+//   5. the policy is pure: the same stamps, the same victim;
+//   6. the two retention policies of the conversation feature agree: below the pinned root this is the same
+//      least-recent-use scan that strata::core::ConversationCache uses for parked conversations.
 #include "strata/program/conv_cache.hpp"
+// The other half of the conversation feature: which whole parked conversations survive. Header-only and
+// CPU-only, so this test can hold both policies to the same rule.
+#include "strata/core/conversation_cache.hpp"
 
 #include <cstdint>
 #include <cstdio>
 #include <vector>
 
 using strata::program::conv_cache::eviction_victim;
+using strata::program::conv_cache::lru_victim;
 
 namespace {
 int g_fail = 0;
@@ -61,6 +67,21 @@ int main() {
         const size_t a = eviction_victim(stamps.data(), stamps.size(), 4);
         const size_t b = eviction_victim(stamps.data(), stamps.size(), 4);
         check(a == 1 && b == 1, "ties among equally stale leaves: the earlier index, deterministically");
+    }
+    {
+        // The two retention policies must not drift apart.  This header picks which CHECKPOINTS of one
+        // branch survive (root pinned, leaves by least recent use); strata::core::ConversationCache picks
+        // which whole PARKED CONVERSATIONS survive (no pin, least recent use).  Below the root they are the
+        // same scan, so pin the shared rule here as well as in conversation_cache_test.cpp.
+        const std::vector<uint64_t> stamps = {1, 9, 4, 4, 6};
+        const std::vector<uint64_t> leaves = {9, 4, 4, 6};
+        check(lru_victim(leaves.data(), leaves.size()) == 1,
+              "the shared least-recent-use scan: smallest stamp, ties to the earlier index");
+        check(eviction_victim(stamps.data(), stamps.size(), 6) == 1 + lru_victim(stamps.data() + 1, stamps.size() - 1),
+              "the pinned chain is that same scan over everything after the root");
+        check(eviction_victim(stamps.data(), stamps.size(), 6) ==
+                  1 + strata::core::ConversationCache::lru_victim(stamps.data() + 1, stamps.size() - 1),
+              "core's parked-conversation victim and this one agree on the same stamps");
     }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;

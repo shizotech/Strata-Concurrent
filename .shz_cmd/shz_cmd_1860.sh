@@ -1,0 +1,1 @@
+cd /ssd/Strata; sed -n '6654,6700p' src/program/generate.cpp; echo "=== ReqCtx prompt cursor fields ==="; grep -n "int64_t at = 0\|std::vector<int64_t> seg\|size_t seg_i\|read_from\|int64_t n = 0\|std::vector<int64_t> ids;" src/program/generate.cpp | head

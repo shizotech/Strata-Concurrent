@@ -22,6 +22,16 @@
 //
 // With a budget below two slots there is no room to keep root and leaf apart, so the pin switches off and
 // the oldest checkpoint leaves - the previous behaviour, one slot = the newest point only.
+//
+// This is ONE of two retention policies in the conversation feature, and they must not be confused:
+//   * here: which CHECKPOINTS of a single conversation branch survive.  They form a prefix chain, so the
+//     root is a prefix of every other item and pinning it is provably the right call;
+//   * strata::core::ConversationCache::lru_victim() (include/strata/core/conversation_cache.hpp): which
+//     WHOLE CONVERSATIONS stay parked, up to `--conversation-cache-slots` of them (default 8).  Those are
+//     independent branches, so there is nothing to pin - one would be a guess about which client comes
+//     back - and the rule is plain least-recent-use with ties to the older parked entry.
+// Both stamp on creation and on every mount, and both break ties on the earlier index, so a set of items
+// nobody has touched leaves in creation order either way.
 #pragma once
 
 #include <cstddef>
@@ -29,15 +39,23 @@
 
 namespace strata::program::conv_cache {
 
+/// The least recently used of `n` stamps: the smallest stamp, ties to the earlier index.  Pure, and the
+/// same rule `strata::core::ConversationCache::lru_victim()` applies to parked conversations - core cannot
+/// include this header (it is the lower layer), so the two are kept identical by test rather than by
+/// inheritance: conv_cache_test.cpp pins this one down, conversation_cache_test.cpp pins that one down.
+inline size_t lru_victim(const uint64_t* stamps, size_t n) {
+    size_t v = 0;
+    for (size_t i = 1; i < n; ++i)
+        if (stamps[i] < stamps[v]) v = i;
+    return v;
+}
+
 /// The index in `stamps` of the chain item to drop once the chain holds more than `cap` items.  `stamps`
 /// are the items' last-use stamps; the caller owns the chain and erases the returned index.  Pure and
 /// deterministic so conv_cache_test.cpp can walk the scenarios by hand.
 inline size_t eviction_victim(const uint64_t* stamps, size_t n, int64_t cap) {
     if (cap < 2 || n < 2) return 0;   // no room for root and leaf: the pin is off, the oldest leaves
-    size_t v = 1;                     // the root (0) is pinned; least recent use among the rest
-    for (size_t i = 2; i < n; ++i)
-        if (stamps[i] < stamps[v]) v = i;
-    return v;
+    return 1 + lru_victim(stamps + 1, n - 1);   // the root (0) is pinned; least recent use among the rest
 }
 
 }  // namespace strata::program::conv_cache

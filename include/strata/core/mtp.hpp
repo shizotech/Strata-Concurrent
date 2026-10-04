@@ -60,6 +60,35 @@ public:
     /// The main model's embedding and head, and the verify window's final residuals (T rows, hc*n_embd each).
     bool bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err);
 
+    // ---- S4.3.4: the KV-ONLY mode (docs/STAGE4-SPLIT-ROLES.md §1.4, OQ-S4-9) ------------------------------
+    // A --role prefill instance never drafts, but it MUST still produce the draft layer's K/V: it is part of the
+    // handoff payload (`SavedConversation::kv` is "main layers followed by the draft layer",
+    // include/strata/core/conversation_cache.hpp:131) and the prompt path writes it from `sp.on_chunk`
+    // (`mtp.prefill` / `Prefill::draft_kv`).  `bind()` cannot be used there: it requires `NativeHead`
+    // (src/core/mtp.cpp:383) and allocates the draft logits + the draft head + the coupled sampler for a head
+    // that instance never runs.
+    /// The KV-only bind: the main model's embedding table and NOTHING ELSE - no head, no verify-window residual
+    /// buffer, no draft logits, no draft head, no coupled sampler.  Call it instead of `bind()`; either order with
+    /// `load()` is legal (it never reads `max_t_`, and `load()` shrinks its buffer arena when the mode is already
+    /// set).  `wt` must contain `output.weight` (only its row count is read) and, at run time,
+    /// `token_embd.weight` - the two the full bind reads from the table too.
+    bool bind_kv_only(const WeightTable& wt, std::string& err);
+    /// True once `bind_kv_only` succeeded: the drafter appends prompt K/V and can never draft.
+    bool kv_only() const { return kv_only_; }
+    /// What `draft`/`draft_first` do in KV-only mode: they never run a draft pass.  They zero every
+    /// `drafts`/`probs` slot, report `*n_drafts = 0`, name the reason in `err` and return false, so a caller
+    /// that forgot the role ends its request loudly instead of verifying a window of made-up tokens.
+    static const char* draft_refusal_reason() { return "mtp: the drafter is bound KV-only (it appends prompt K/V "
+                                                      "and never drafts)"; }
+    /// How many draft calls KV-only mode refused.  A prefill instance's counter must stay 0 forever: a non-zero
+    /// value means something reached a decode path it should not have (it is still safe - no draft ran).
+    int64_t draft_refusals() const { return draft_refusals_; }
+    /// The device bytes the KV-only mode does not allocate (the buffers only a draft pass touches - see
+    /// `record_forward`'s `if (!full) return true;`).  0 before `load()`; after it, the number `load()` skipped
+    /// when the mode was already set, or the number it WOULD have saved when it was not (so a role that binds
+    /// late can still see what binding early is worth).
+    uint64_t draft_only_bytes() const;
+
     /// Prompt cells [cell0, cell0 + n): residual rows `R_rows` (device, hc*n_embd each) and `next_tokens` (host,
     /// the token at position cell+1).  Runs in batches of up to max_t rows.
     bool prefill(const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err);
@@ -106,6 +135,9 @@ private:
     bool capture_prefill_dev(int T, std::string& err);   ///< E-4: without the mapped staging (inputs copied on device)
     bool capture_round(int T, bool coupled, std::string& err);
     bool capture_step(int j, bool coupled, std::string& err);
+    /// KV-only mode: refuse a draft round instead of running it - 0 candidates, `drafts`/`probs` zeroed.
+    /// `draft` and `draft_first` share it so the two entry points cannot drift apart.
+    bool refuse_draft(int T, int32_t* drafts, float* probs, int* n_drafts, std::string& err);
     cudaGraphExec_t step_exec_[9] = {};
     // coupled draft sampling: its own round/step graphs (the argmax ones stay as they were), the request's
     // parameters and the penalty ring (mapped staging + device copies), the split scratch, token id -> subset index
@@ -114,6 +146,10 @@ private:
     cudaGraphExec_t step_exec_c_[9] = {};
     bool coupled_ok_ = false, coupled_active_ = false;
     bool coupled_rec_ = false;   ///< record_forward: the full layer ends in the coupled sampler (draft coupled_j_)
+    // S4.3.4: the KV-only mode (bind_kv_only) and its bookkeeping
+    bool kv_only_ = false;
+    int64_t draft_refusals_ = 0;   ///< draft()/draft_first() calls refused because of the mode
+    uint64_t draft_only_bytes_ = 0;   ///< what `load()` did not allocate because of the mode
     int coupled_j_ = 0;
     strata::kernels::SamplerParams *h_cparams_ = nullptr, *m_cparams_ = nullptr, *cparams_ = nullptr;
     int32_t *h_chist_ = nullptr, *m_chist_ = nullptr, *cring_ = nullptr, *dinv_ = nullptr;

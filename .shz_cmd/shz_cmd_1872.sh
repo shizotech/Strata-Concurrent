@@ -1,0 +1,1 @@
+cd /ssd/Strata; grep -n "swap_park_refused\|swap_park_kind" src/program/generate.cpp; echo "=== live_ok cleared for the whole request? (the child's root cause) ==="; grep -n "live_ok = false\|live_ok = true" src/program/generate.cpp | head

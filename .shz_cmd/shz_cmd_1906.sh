@@ -1,0 +1,1 @@
+echo "=== is the server.py parent alive, and on what port? ==="; pgrep -af "serve/server.py" | sed 's/--config.*--port/ --port/'; echo; echo "=== listening ports ==="; ss -ltnp 2>/dev/null | grep -E "python|strata" | head; echo; echo "=== engine 1791211 alive + its GPU ==="; ls -d /proc/1791211 && cat /proc/1791211/status | grep -E "^State"

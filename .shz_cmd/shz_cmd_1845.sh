@@ -1,0 +1,1 @@
+cd /ssd/Strata; echo "=== new predicates in serve_swap.hpp ==="; grep -n "^inline \|^struct " include/strata/program/serve_swap.hpp | tail -20; echo; echo "=== new in serve_driver.hpp ==="; grep -n "^inline \|^struct \|^enum " include/strata/program/serve_driver.hpp | tail -15

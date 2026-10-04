@@ -1518,8 +1518,21 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         lbytes.push_back(lay.blob_bytes(l) * (uint64_t) n_expert);
     }
     bounds.push_back(want);
+    // THE SHARED BACKING IS AN OPTIMISATION, NOT A REQUIREMENT.  It is on by default on Linux, which means it
+    // must degrade gracefully everywhere it cannot work: Docker's default /dev/shm is 64 MiB (the arena is
+    // 47 GiB, so `ftruncate` answers ENOSPC), a container may mount it read-only, the path may not be writable,
+    // or the file may hold another model's arena (pack hash mismatch).  In every one of those the right answer
+    // is the private anonymous arena this code used before - slower to start, more RAM, but CORRECT - and a
+    // note that says which happened and why.  Refusing to start would turn a missing optimisation into an
+    // outage, and on a machine running several servers it would take the whole install down.
     PinnedArena* a = new PinnedArena(want + (uint64_t) blob, bounds, max_pinned_bytes,
                                      shared_arena_file, pack_hash);
+    std::string shared_fallback;
+    if (!a->valid() && !shared_arena_file.empty()) {
+        shared_fallback = a->note;
+        delete a;
+        a = new PinnedArena(want + (uint64_t) blob, bounds, max_pinned_bytes, {}, 0);
+    }
     if (!a->valid()) {
         const std::string why = a->note;
         delete a;
@@ -1528,9 +1541,33 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
               (why.empty() ? std::string{} : ": " + why);
         return false;
     }
-    const LoadStats st = from_gguf ? load_experts_gguf(gguf_, a->data(), lay, threads)
-                                   : load_experts_ranges(path, a->data(), loff, lbytes, threads, /*chunk=*/8u << 20);
+    // THE ARENA IS LOADED ONCE, NOT ONCE PER PROCESS.  `PinnedArena` decided the role under the backing file's
+    // lock: either this process owns the load, or the bytes are already there for this pack hash.  Re-reading
+    // 46.84 GiB that another process already put in the shared file is what made the second server take minutes
+    // (strata-iq3_s.log:1438: "loaded 46.84 GiB at 0.09 GiB/s" - it was WRITING the same tmpfs pages the first
+    // server had just written), and re-reading while another process is mid-load is not slow but WRONG: the
+    // arena would hold two interleaved copies of the experts.
+    //
+    // READ THE ROLE NOW, BEFORE ANYTHING ELSE TOUCHES IT.  `publish_shared_load()` clears `shared_load_owner`
+    // and sets `shared_borrowed` when it succeeds - correctly, for the arena: after publishing, its bytes ARE
+    // borrowable, by this process included.  But the caller's question is "did I load it?", and answering that
+    // from the post-publish flags would report the OWNER as a borrower and print "nothing loaded" for the one
+    // process that just spent a minute loading.  So the role is snapshotted here and used throughout.
+    const bool borrowed_arena = a->shared_borrowed;
+    const bool owns_the_load = a->shared_load_owner;
+    LoadStats st;
+    if (borrowed_arena) {
+        st.layers = (uint64_t) n_layers;
+        st.bytes = want;
+        st.seconds = 0.0;
+    } else if (from_gguf) {
+        st = load_experts_gguf(gguf_, a->data(), lay, threads);
+    } else {
+        st = load_experts_ranges(path, a->data(), loff, lbytes, threads, /*chunk=*/8u << 20);
+    }
     if (!st.ok) {
+        // `delete` releases this process's claim on the shared header, so the next process does not sit and
+        // wait for a load that just failed.
         delete a;
         err = "ArenaExpertSource: the expert load was refused: " + (st.error.empty() ? std::string("unknown") : st.error);
         return false;
@@ -1539,6 +1576,18 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         delete a;
         err = "ArenaExpertSource: the load read " + std::to_string(st.bytes) + " B of " + std::to_string(want);
         return false;
+    }
+    // Publish only AFTER the whole body is in place: this is the store that tells every other process the
+    // arena may be read.  A failure here is fatal rather than a warning - an arena that cannot announce itself
+    // is an arena whose contents nobody can trust.
+    if (owns_the_load) {
+        std::string why;
+        if (!a->publish_shared_load(&why)) {
+            delete a;
+            err = "ArenaExpertSource: the shared expert arena could not be published: " +
+                  (why.empty() ? std::string("unknown") : why);
+            return false;
+        }
     }
     arena_ = a;
     base_ = a->data();
@@ -1562,6 +1611,10 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     n_expert_ = n_expert;
     reads_ = 0;
     note_ = a->note;
+    if (!shared_fallback.empty())
+        note_ = "shared arena " + shared_arena_file + " refused (" + shared_fallback +
+                "); using a private arena for this process" + (note_.empty() ? std::string{} : "; " + note_);
+    borrowed_ = borrowed_arena;
     gib_per_s_ = st.gib_per_second();
     load_seconds_ = st.seconds;
     load_read_s_ = st.read_seconds;
@@ -1577,6 +1630,7 @@ void ArenaExpertSource::close() {
     base_ = nullptr;
     blobs_ = 0;
     n_expert_ = 0;
+    borrowed_ = false;
 }
 
 bool ArenaExpertSource::pinned(int64_t layer, int64_t expert) const {

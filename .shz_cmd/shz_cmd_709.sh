@@ -1,0 +1,1 @@
+cd /ssd/Strata && date && ls -l --time-style=full-iso include/strata/program/prefill_svc.hpp src/program/prefill_svc_test.cpp .megamind/taskboard.md .megamind/roadmap.md .megamind/src/program/s433-prefill-protocol-notes.md include/strata/program/serve_driver.hpp include/strata/program/serve_proto.hpp CMakeLists.txt | awk '{print $6, $7, $NF}'

@@ -1,0 +1,1 @@
+cd /ssd/Strata && grep -n "concurrent driver on\|serve-slots\|slots=" strata-iq3_s.log | head -20; echo "=== session is up ==="; grep -n "session is up" strata-iq3_s.log | head -20; echo "=== window up to ==="; grep -n "window up to" strata-iq3_s.log

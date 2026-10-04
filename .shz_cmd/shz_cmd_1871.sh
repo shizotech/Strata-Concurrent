@@ -1,0 +1,1 @@
+cd /ssd/Strata; echo "=== publish/restore called? ==="; grep -n "publish_decode_branch(\|restore_published_branch(" src/program/generate.cpp; echo; echo "=== driver handles the two refusal kinds? ==="; grep -n "swap_park_refused\|swap_park_kind\|budget_too_small\|not_saveable" src/program/generate.cpp | head -12

@@ -1,0 +1,1 @@
+cd /ssd/Strata && grep -n "constexpr int WARP\|constexpr int WARPS\|struct Q81Block\|constexpr int Q8K\|constexpr int QK\|constexpr int QI\|constexpr int VDR\|QUANT_THREADS" src/kernels/cuda/native_mmvq.cu | head -30

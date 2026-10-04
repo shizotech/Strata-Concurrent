@@ -1,0 +1,1 @@
+cd /ssd/Strata && rm -f /tmp/banner_check /tmp/banner_check.cpp; echo "=== files modified after 11:00 today (my working window) ==="; find . -newermt "2026-10-04 11:00" -type f \( -name "*.cpp" -o -name "*.hpp" -o -name "*.py" -o -name "*.md" -o -name "CMakeLists.txt" \) -not -path "./build*" -not -path "./.git/*" -not -path "/tmp/*" -printf "%TH:%TM %p\n" | sort

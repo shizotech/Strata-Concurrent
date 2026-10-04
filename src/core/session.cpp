@@ -535,9 +535,32 @@ bool SessionLoopScratch::init(size_t parts_bytes_in, std::string& err) {
     // core or its SMT sibling.  The symptom is not an error: it is a CPU path at 26.9 GB/s where the same pool
     // runs at 36.32.  It was being done and undone on EVERY token, which is a syscall pair on the critical path
     // for a property that wants to hold for the whole session.
-    const std::vector<int> cores = strata::kernels::cpu::physical_cores(false);
-    if (!cores.empty()) {
-        pinned_core = strata::kernels::cpu::pin_current_thread(cores[0]);
+    //
+    // **THE CORE COMES FROM THE POOL'S PLAN, NOT FROM `physical_cores(false)[0]` (A2).**  That used to be
+    // hardcoded, and it was fine until a second process existed: the pool may now have taken a DIFFERENT core
+    // as its host core (and different workers), and a host pinned to CPU 0 while the other tenant owns CPU 0
+    // is exactly the collapse this is meant to end.  `core_plan()` is the same claim the pool's workers were
+    // built from, so the two halves of the reservation cannot drift apart.  On a quiet machine that claim is
+    // `physical_cores(false)` in the same order, so a single process pins CPU 0 exactly as it always did.
+    int host_core = -1;
+    const strata::kernels::cpu::CorePlan& claimed = strata::kernels::cpu::core_plan();
+    if (!claimed.host.empty()) {
+        host_core = claimed.host[0];
+    } else if (claimed.workers.empty()) {
+        // No pool has claimed cores in this process.  Claim the HOST ONLY (0 workers): taking a worker set
+        // nobody will use would strand cores from the other tenant for the whole session.  Never call
+        // `claim_cores` with a count that differs from the pool's - that would re-partition underneath it.
+        const strata::kernels::cpu::CorePlan& mine = strata::kernels::cpu::claim_cores(0);
+        if (!mine.host.empty()) host_core = mine.host[0];
+    }
+    if (host_core < 0) {
+        // A plan that named no host CPU (no topology readable, or every logical CPU already taken and the
+        // claim came from a pool): fall back to today's behaviour rather than leaving the host unpinned.
+        const std::vector<int> cores = strata::kernels::cpu::physical_cores(false);
+        if (!cores.empty()) host_core = cores[0];
+    }
+    if (host_core >= 0) {
+        pinned_core = strata::kernels::cpu::pin_current_thread(host_core);
         pinned = true;
     }
     return true;

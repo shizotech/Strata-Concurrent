@@ -1,0 +1,1 @@
+cd /ssd/Strata && git status --porcelain | grep -v "^ M \(serve\|setup.py\|README\|docs\|CMakeLists\|include/strata/core/conversation\|include/strata/core/expert\|include/strata/core/pinned\|include/strata/kernels\|include/strata/program/conv\|src/core/conversation\|src/core/expert\|src/core/pinned\|src/core/session\|src/kernels\|src/program/generate\|src/program/conv\|tests/\)" 

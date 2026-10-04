@@ -5,9 +5,12 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <functional>
 #include <limits>
 #include <cstring>
+#include <memory>
+#include <vector>
 
 #if defined(CONVERSATION_TEST_TRANSFERS)
 // GNU/ELF link wrapping exercises the actual restore control flow without
@@ -230,10 +233,314 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     check(unpublished.kv.empty() && unpublished.live.ids.empty(), "failed incremental capture cannot publish a partial image");
 #endif
 }
+
+// ===================== S3.1a: PARKING ACROSS A `--layer-split` =====================
+//
+// A split runs the model across several devices and each stage's `SessionState` owns only its
+// layer carve (#216).  A parked conversation is therefore the FIRST stage's state (CUDA0's, the
+// snapshot's `session` argument) PLUS one part per later stage PLUS the MTP draft state, which
+// the engine binds to the last stage.  This fixture builds that shape out of host buffers - no
+// CUDA is initialized - splits the model N ways, and checks that the byte accounting sees every
+// part and that a corrupted stage part is refused before a single byte of any session is written.
+// The park/mount round trip needs the injected host transfer backend, so it is under the same
+// `CONVERSATION_TEST_TRANSFERS` switch the single-GPU round trip already uses.
+struct Carve {
+    ModelGeometry g;
+    int64_t lo = 0, hi = 0;
+    std::vector<Pools> layers;         ///< one per OWNED QSA ordinal
+    std::vector<QsaState> qsa_store;   ///< n_qsa_layers entries, exactly as session_init allocates them
+    std::vector<uint8_t> gdn, ple;
+    SessionState ss;
+    Carve(const ModelGeometry& geometry, int64_t from, int64_t to, int format)
+        : g(geometry), lo(from), hi(to) {
+        const int64_t I = std::max<int64_t>(g.qsa_interval, 1);
+        const int64_t q_alloc = std::max<int64_t>(hi / I - lo / I, g.n_qsa_layers() > 0 ? 1 : 0);
+        for (int64_t j = 0; j < q_alloc; ++j) layers.emplace_back(g, format);
+        ss.max_cells = 96;
+        ss.layer_lo = lo; ss.layer_hi = hi;
+        ss.qsa_ord0 = lo / I; ss.qsa_alloc = q_alloc;
+        ss.gdn_ord0 = lo - lo / I;
+        ss.gdn_alloc = std::max<int64_t>((hi - lo) - (hi / I - lo / I), 0);
+        ConversationStateSizes z;
+        std::string ignored;
+        conversation_session_sizes(g, ss, z, ignored);
+        gdn.assign(z.gdn, 0xa5);
+        ple.assign(z.ple, 0xa5);
+        ss.gdn_state = (float*) gdn.data();
+        ss.ple_hist = (float*) ple.data();
+        // session_init allocates the WHOLE n_qsa_layers array and initializes only the range's
+        // ordinals; the rest stay nulls a snapshot must never read.
+        if (g.n_qsa_layers() > 0) {
+            qsa_store.assign((size_t) g.n_qsa_layers(), QsaState{});
+            for (int64_t j = 0; j < q_alloc; ++j) qsa_store[(size_t) (ss.qsa_ord0 + j)] = layers[(size_t) j].st;
+            ss.qsa_states = qsa_store.data();
+        }
+    }
+    void paint(uint8_t salt) {
+        std::fill(gdn.begin(), gdn.end(), salt); std::fill(ple.begin(), ple.end(), salt);
+        for (auto& p : layers) for (auto& bytes : p.data) std::fill(bytes.begin(), bytes.end(), salt);
+    }
+    bool pristine() const {
+        auto all = [](const std::vector<uint8_t>& b) {
+            return std::all_of(b.begin(), b.end(), [](uint8_t v) { return v == 0xa5; });
+        };
+        if (!all(gdn) || !all(ple)) return false;
+        for (const auto& p : layers) for (const auto& bytes : p.data) if (!all(bytes)) return false;
+        return true;
+    }
+};
+
+#if defined(CONVERSATION_TEST_TRANSFERS)
+bool equal(const ConversationKv& a, const ConversationKv& b) {
+    return a.k == b.k && a.v == b.v && a.k_scale == b.k_scale && a.v_scale == b.v_scale && a.pooled == b.pooled;
+}
+#endif
+
+/// `splits` are the cut points after the first stage: {4} is a two-carve split of 8 layers and
+/// {2,5} a three-carve one.  The first stage is CUDA0's session - the snapshot's `session`
+/// argument - and the rest are the stage set.
+void split_fixture(int format, const std::vector<int64_t>& splits) {
+    ModelGeometry g;
+    g.n_layers = 8; g.n_expert = 256;
+    g.ssm_state_size = 2; g.ssm_v_heads = 2; g.ssm_conv_channels = 8;
+    g.n_head_kv = 1; g.head_dim = 64; g.idx_key_dim = 8;
+    std::vector<int64_t> bounds{0};
+    for (int64_t s : splits) bounds.push_back(s);
+    bounds.push_back(g.n_layers);
+    std::vector<std::unique_ptr<Carve>> carves;
+    for (size_t i = 0; i + 1 < bounds.size(); ++i)
+        carves.push_back(std::make_unique<Carve>(g, bounds[i], bounds[i + 1], format));
+    Carve& main = *carves[0];
+    Pools draft(g, format);
+    std::vector<ConversationStage> stage_list;
+    for (size_t i = 1; i < carves.size(); ++i) stage_list.push_back({&carves[i]->ss, (int) i});
+    // main_device/draft_device stay -1: a host-only fixture, and OnDevice(-1) never asks CUDA
+    // anything.  The engine passes 0 and the last stage's device instead.
+    const ConversationStageSet stages{stage_list.empty() ? nullptr : stage_list.data(),
+                                      (int64_t) stage_list.size(), -1, -1};
+    std::vector<int32_t> ids(9);
+    for (size_t i = 0; i < ids.size(); ++i) ids[i] = (int32_t) i + 1;
+    std::vector<ConversationImageKey> images{{1, 44}};
+    auto part_of = [&](Carve& c) {
+        ConversationCheckpoint p;
+        p.ids = ids;
+        ConversationStateSizes z;
+        std::string ignored;
+        conversation_session_sizes(g, c.ss, z, ignored);
+        p.gdn.assign(z.gdn, 13); p.ple.assign(z.ple, 13);
+        p.tails.assign((size_t) c.ss.qsa_alloc * z.tail, 13);
+        p.dead.assign((size_t) c.ss.qsa_alloc * z.dead, 13);
+        p.block_pos.assign((size_t) c.ss.qsa_alloc * z.block_pos, 13);
+        return p;
+    };
+    std::vector<ConversationCheckpoint> checkpoints{part_of(main)};
+    checkpoints[0].imgs = images;   // the images belong to the conversation, not to one stage
+    for (size_t i = 1; i < carves.size(); ++i) checkpoints[0].stage_parts.push_back(part_of(*carves[i]));
+    const ConversationView view{ids, images, checkpoints, true};
+    std::string error;
+
+    // A hand-built valid image: the host-only build cannot save, and validation must reject a
+    // corrupt part whether or not CUDA is reachable.
+    SavedConversation base;
+    base.geometry = {g.n_embd,g.n_layers,g.qsa_interval,g.ssm_state_size,g.ssm_k_heads,g.ssm_v_heads,
+                     g.ssm_d_conv,g.ssm_conv_channels,g.ssm_value_dim,g.n_head,g.n_head_kv,g.head_dim,
+                     g.idx_q_heads,g.idx_key_dim,g.hc,g.hc_lr,g.n_expert,g.n_ff};
+    base.layer_lo = main.lo; base.layer_hi = main.hi;
+    base.live = part_of(main); base.live.imgs = images;
+    base.checkpoints = checkpoints;
+    base.kv.reserve(main.layers.size() + 1);
+    for (const auto& p : main.layers) base.kv.push_back(p.image(g, true));
+    base.kv.push_back(draft.image(g, false));
+    base.stage_parts.reserve(carves.size() - 1);
+    for (size_t i = 1; i < carves.size(); ++i) {
+        ConversationStageSnapshot part;
+        part.layer_lo = carves[i]->lo; part.layer_hi = carves[i]->hi;
+        part.state = part_of(*carves[i]);
+        part.kv.reserve(carves[i]->layers.size());
+        for (const auto& p : carves[i]->layers) part.kv.push_back(p.image(g, true));
+        base.stage_parts.push_back(std::move(part));
+    }
+    check(conversation_snapshot_validate(base, main.ss, stages, g, draft.st, error), "split image validates");
+    size_t estimate = 0, plain = 0;
+    check(conversation_snapshot_bytes(view, main.ss, stages, g, draft.st, estimate, error),
+          "split capture estimate works without CUDA");
+    check(estimate == base.bytes(), "the split estimate covers every stage part and its K/V");
+    // A refused estimate must not leave a half-written number behind either.
+    check(!conversation_snapshot_bytes(view, main.ss, {}, g, draft.st, plain, error),
+          "a chain carrying stage parts cannot be parked without a stage set");
+    check(plain == 0, "a refused single-GPU estimate reports no bytes");
+    check(!conversation_snapshot_validate(base, main.ss, {}, g, draft.st, error),
+          "a split image is refused without a stage set");
+    check(base.stage_parts.size() == carves.size() - 1, "one stage part per later stage");
+    for (size_t i = 0; i < base.stage_parts.size(); ++i) {
+        const Carve& c = *carves[i + 1];
+        check(base.stage_parts[i].layer_lo == c.lo && base.stage_parts[i].layer_hi == c.hi,
+              "stage part records the carve it came from");
+        check(base.stage_parts[i].kv.size() == (size_t) c.ss.qsa_alloc,
+              "a stage part holds only its own carve's K/V, never a draft entry");
+        check(base.stage_parts[i].state.gdn.size() < (size_t) 1 << 20, "a stage part is carve-sized");
+    }
+    // ---- all-or-nothing: every way a stage part can be wrong is refused with no CUDA and no write ----
+    auto unchanged_all = [&] {
+        auto all = [](const std::vector<uint8_t>& b) {
+            return std::all_of(b.begin(), b.end(), [](uint8_t v) { return v == 0xa5; });
+        };
+        for (const auto& c : carves) if (!c->pristine()) return false;
+        for (const auto& bytes : draft.data) if (!all(bytes)) return false;
+        return true;
+    };
+    auto reject = [&](const std::function<void(SavedConversation&)>& mutate, const char* label) {
+        auto bad = base; mutate(bad);
+        check(conversation_snapshot_restore(bad, main.ss, stages, g, draft.st, error) == ConversationRestore::invalid,
+              label);
+        check(unchanged_all(), "invalid split restore did not touch any stage or the draft");
+    };
+    check(unchanged_all(), "the split fixture starts pristine");
+    reject([](auto& s){ s.stage_parts.back().kv.back().k.pop_back(); },
+           "corrupt last-stage K/V rejected before any write");
+    reject([](auto& s){ s.stage_parts.front().state.gdn.pop_back(); },
+           "corrupt first-stage running state rejected before any write");
+    reject([](auto& s){ s.stage_parts.back().state.tails.push_back(0); },
+           "wrong-size stage indexer payload rejected before any write");
+    reject([](auto& s){ s.stage_parts.pop_back(); }, "a snapshot missing a stage part is rejected");
+    reject([](auto& s){ s.stage_parts[0].layer_hi = s.stage_parts[0].layer_hi + 1; },
+           "a stage part from another carve is rejected");
+    reject([](auto& s){ s.checkpoints[0].stage_parts.back().dead.pop_back(); },
+           "corrupt retained-checkpoint stage part rejected before any write");
+    reject([](auto& s){ s.checkpoints[0].stage_parts.pop_back(); },
+           "a retained checkpoint missing a stage part is rejected");
+    reject([](auto& s){ s.kv.back().k.pop_back(); }, "corrupt draft rejected before any stage write");
+    reject([](auto& s){ s.stage_parts.back().state.ids[0] = 99; },
+           "a stage part that is not the live prefix is rejected");
+    reject([](auto& s){ s.stage_parts.back().state.imgs.push_back({0, 7}); },
+           "a stage part carrying images is rejected");
+    reject([](auto& s){ s.live.stage_parts.push_back(s.stage_parts[0].state); },
+           "a live checkpoint carrying stage parts is still refused");
+    // A stage set that does not tile the model is a wiring bug, not a smaller conversation.
+    {
+        SessionState short_main = main.ss;   // the same buffers, a range that stops one layer early
+        short_main.layer_hi = g.n_layers - 1;
+        size_t refused = 1;
+        check(!conversation_snapshot_bytes(view, short_main, stages, g, draft.st, refused, error),
+              "stage set that does not cover the model is rejected");
+        check(refused == 0, "a refused estimate reports no bytes");
+        std::vector<ConversationStage> with_null = stage_list;
+        with_null.push_back(ConversationStage{nullptr, -1});
+        const ConversationStageSet null_set{with_null.data(), (int64_t) with_null.size(), -1, -1};
+        check(!conversation_snapshot_bytes(view, main.ss, null_set, g, draft.st, refused, error),
+              "a stage with no session behind it is rejected");
+        check(refused == 0, "a refused stage-set estimate reports no bytes");
+    }
+#if defined(CONVERSATION_TEST_TRANSFERS)
+    // ---- the round trip: park, scribble over every stage, mount, park again, compare ----
+    SavedConversation image;
+    if (!conversation_snapshot_save(image, view, main.ss, stages, g, draft.st, error))
+        std::fprintf(stderr, "split capture error: %s\n", error.c_str());
+    check(conversation_snapshot_save(image, view, main.ss, stages, g, draft.st, error), "split capture");
+    check(image.stage_parts.size() == carves.size() - 1, "one stage part per later stage");
+    check(image.live.stage_parts.empty(), "a parked image keeps its stage state in stage_parts");
+    check(image.checkpoints[0].stage_parts.size() == carves.size() - 1,
+          "the retained checkpoints keep the upstream chain's stage parts");
+    check(image.bytes() == estimate, "a split capture's bytes match its admitted estimate");
+    SavedConversation single_gpu;
+    check(!conversation_snapshot_save(single_gpu, view, main.ss, g, draft.st, error),
+          "a split checkpoint chain cannot be captured as a single-GPU image");
+    for (auto& c : carves) c->paint(0x31);
+    for (auto& bytes : draft.data) std::fill(bytes.begin(), bytes.end(), 0x31);
+    check(!unchanged_all(), "the split fixture really scribbled over every stage");
+    const int mount_c0 = copy_calls, mount_s0 = sync_calls;
+    check(conversation_snapshot_restore(image, main.ss, stages, g, draft.st, error) == ConversationRestore::restored,
+          "split restore mounts every stage");
+    const int mount_copies = copy_calls - mount_c0, mount_syncs = sync_calls - mount_s0;
+    check(mount_syncs == (int) carves.size() + 1,
+          "split mount synchronizes the main device, the draft's and every stage's own");
+    for (size_t i = 0; i < carves.size(); ++i) {
+        const ConversationCheckpoint& saved = i == 0 ? image.live : image.stage_parts[i - 1].state;
+        check(carves[i]->gdn == saved.gdn && carves[i]->ple == saved.ple, "stage running state restored");
+    }
+    check(main.ss.ple_prev[0] == 8 && main.ss.ple_prev[1] == 9, "PLE window restored from a split image");
+    // A failure anywhere in the stage parts is fatal to the session, never a fallback to
+    // "invalid image, keep the old one": the caller has already parked the outgoing conversation.
+    // The state at this point is no longer the 0xa5 sentinel, so "did this restore change anything"
+    // is answered by fingerprinting every buffer before and after.
+    auto fingerprint_all = [&] {
+        uint64_t h = 1469598103934665603ull;
+        auto feed = [&](const std::vector<uint8_t>& b) {
+            for (size_t i = 0; i < b.size(); ++i) { h ^= b[i]; h *= 1099511628211ull; }
+        };
+        for (const auto& c : carves) { feed(c->gdn); feed(c->ple); for (const auto& p : c->layers) for (const auto& b : p.data) feed(b); }
+        for (const auto& b : draft.data) feed(b);
+        return h;
+    };
+    auto scribble = [&] {
+        for (auto& c : carves) c->paint(0x31);
+        for (auto& bytes : draft.data) std::fill(bytes.begin(), bytes.end(), 0x31);
+        std::fill(main.ss.ple_prev, main.ss.ple_prev + 2, -1);
+    };
+    scribble();
+    copy_calls = sync_calls = 0; fail_sync = 1;
+    const uint64_t before_pre_sync = fingerprint_all();
+    check(conversation_snapshot_restore(image, main.ss, stages, g, draft.st, error) == ConversationRestore::transfer_failed,
+          "split: pre-transfer synchronization failure is fatal");
+    check(copy_calls == 0 && fingerprint_all() == before_pre_sync,
+          "split: pre-sync failure wrote nothing to any stage");
+    scribble();
+    fail_sync = 0; copy_calls = sync_calls = 0; fail_copy = mount_copies;
+    const uint64_t before_last_copy = fingerprint_all();
+    check(conversation_snapshot_restore(image, main.ss, stages, g, draft.st, error) == ConversationRestore::transfer_failed,
+          "split: a transfer failure in the last stage part is fatal, not an invalid-image fallback");
+    check(fingerprint_all() != before_last_copy, "split: the last-copy failure genuinely left partial state");
+    scribble();
+    fail_copy = 0; copy_calls = sync_calls = 0; fail_sync = mount_syncs;
+    const uint64_t before_stage_sync = fingerprint_all();
+    check(conversation_snapshot_restore(image, main.ss, stages, g, draft.st, error) == ConversationRestore::transfer_failed,
+          "split: a per-stage synchronization failure is fatal");
+    check(sync_calls == mount_syncs && fingerprint_all() != before_stage_sync,
+          "split: the per-stage synchronization really happens, after the stage writes");
+    fail_sync = 0; copy_calls = sync_calls = 0;
+    // Re-capturing the mounted state must reproduce the same bytes on every stage: the A/B/A
+    // exactness the single-GPU test already demands, now across a carve.
+    SavedConversation again;
+    check(conversation_snapshot_save(again, view, main.ss, stages, g, draft.st, error),
+          "re-capture after a split mount");
+    check(again.stage_parts.size() == image.stage_parts.size(), "re-capture keeps the same stage count");
+    for (size_t i = 0; i < image.stage_parts.size(); ++i) {
+        const auto& x = again.stage_parts[i]; const auto& y = image.stage_parts[i];
+        check(x.state.gdn == y.state.gdn && x.state.tails == y.state.tails &&
+              x.state.dead == y.state.dead && x.state.block_pos == y.state.block_pos && x.state.ple == y.state.ple,
+              "split A/B/A stage running state is byte-exact");
+        for (size_t j = 0; j < y.kv.size(); ++j) check(equal(x.kv[j], y.kv[j]), "split A/B/A stage K/V is byte-exact");
+    }
+    check(again.live.gdn == image.live.gdn && again.live.dead == image.live.dead &&
+          equal(again.kv[0], image.kv[0]) && equal(again.kv.back(), image.kv.back()),
+          "split A/B/A main session and draft are byte-exact");
+    // Retention stays the single-GPU optimization: the retained set is the main layers plus the
+    // draft, never a stage's, and a split capture still honours the admitted bound.
+    ConversationKvReuse reuse{image.kv, 9, 9};
+    size_t peak = 0, reused = 0;
+    check(conversation_snapshot_capture_bytes(reuse, view, main.ss, stages, g, draft.st, peak, error),
+          "retained main K/V still admits a split capture");
+    SavedConversation incremental;
+    check(conversation_snapshot_save(incremental, view, main.ss, stages, g, draft.st, error,
+                                     std::move(reuse), &reused), "incremental split capture");
+    check(reused > 0 && incremental.bytes() <= peak, "incremental split capture stays within its admission");
+    check(incremental.stage_parts.size() == image.stage_parts.size() && incremental.bytes() == image.bytes(),
+          "an incremental split capture is the same image");
+    reuse = {image.kv, 9, 9};
+    reuse.kv.push_back(image.kv[0]);
+    check(!conversation_snapshot_capture_bytes(reuse, view, main.ss, stages, g, draft.st, peak, error),
+          "a retained set that is not exactly the main layers plus the draft is rejected");
+#endif
+}
 }
 
 int main() {
     for (int format : {0,1,2}) for (int experts : {256,512})
         for (bool zero_qsa : {false,true}) for (bool ple : {false,true}) fixture(format,experts,zero_qsa,ple);
+    // S3.1a: two- and three-carve splits, and a stage range with no QSA layer of its own.
+    for (int format : {0,1,2}) for (std::vector<int64_t> cuts : {std::vector<int64_t>{4},
+                                                                 std::vector<int64_t>{2,5},
+                                                                 std::vector<int64_t>{1,6}})
+        split_fixture(format, cuts);
     std::printf("conversation_validation_test: %d host-only checks passed\n", checks);
 }

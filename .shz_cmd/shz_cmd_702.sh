@@ -1,0 +1,1 @@
+cd /ssd/Strata && grep -c "^// DEV-" include/strata/program/prefill_svc.hpp; grep -n "^14\.\|^15\." .megamind/src/program/s433-prefill-protocol-notes.md; sed -i 's/for the 15 deviations from §4/for the 14 deviations from §4/' .megamind/roadmap.md; grep -n "deviations from §4" .megamind/roadmap.md
