@@ -13,6 +13,19 @@ of a word): faster than you can read.
 
 - **Free and open source.**
 
+### ✨ New in this fork: several chats at once
+
+- ✅ **Serve several conversations at the same time** - `--serve-slots 3` (2-8)
+- ✅ **Requests wait instead of failing** - a busy machine queues your request and runs it, rather than
+  returning an error (`--hold-ms`)
+- ✅ **Conversations are put to one side and picked straight back up** - never re-read from scratch, never lost
+- ✅ **Fair sharing** - a token budget per turn (`--decode-tokens`) and a fairness limit (`--starve-ms`)
+- ✅ **One shared copy of the model in RAM** for several Strata servers on one PC (`--shared-expert-arena`, Linux)
+- ✅ **You can see what it is doing** - a periodic `activity:` line, plus `GET /status`, `GET /slots`, `GET /metrics`
+
+All of it is **opt-in and off by default**: without `--serve-slots` this behaves exactly like upstream, and none of
+it changes the answers you get. → [Several chats at once](#several-chats-at-once) · [What's different here](#whats-different-here)
+
 > **Jump to:** [How fast?](#how-fast-is-it) · [Which model?](#which-model-should-i-pick) · [Install](#install) ·
 > [Using it](#using-it) · [Several chats at once](#several-chats-at-once) · [What's different here](#whats-different-here) ·
 > [Problems?](#something-went-wrong) · [How it works](#how-does-it-work) · [All the details](docs/DETAILS.md)
