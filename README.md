@@ -159,6 +159,9 @@ Sizes, downloads and what fits where: [docs/MODELS.md](docs/MODELS.md). To add a
   set `"parallel": 2` ([BATCHING.md](docs/BATCHING.md)). On a 12 GB card this makes each answer slower.
 - **Long prompts:** Strata reads the first message of a chat in full, about 1 minute per 30,000 tokens. Follow-up
   messages start in seconds.
+- **Two Strata servers on one Linux PC** share one copy of the model's experts in RAM: the first one loads them,
+  the others map the same bytes, so a second server starts in seconds instead of a minute.
+  See [Two Strata servers on one PC](docs/DETAILS.md#two-strata-servers-on-one-pc-linux).
 
 More: [where your chats are stored](docs/INSTALL.md#where-things-are-stored), [the API](docs/DETAILS.md#using-it).
 

@@ -542,6 +542,41 @@ Terminal chat: `.venv/bin/python chat.py`.
 
 ---
 
+## Two Strata servers on one PC (Linux)
+
+You can run more than one model server on the same machine - two models, or the same model twice on two cards.
+Each server is its own process with its own weights on its own GPU, but the biggest thing they would otherwise
+duplicate is shared instead:
+
+- **The experts are loaded once, not once per server.** The 34-50 GB of expert weights live in one file
+  (`--shared-expert-arena`, default `/dev/shm/shared_experts.dat`) that every server maps. The first server to
+  start loads them; the others map the same bytes and load nothing, so a second server starts in seconds instead
+  of a minute and the machine holds ONE copy of the experts rather than one per server. The file is on
+  `/dev/shm` (RAM), so it counts against your RAM exactly once. The engine says which it did:
+  `expert arena borrowed from another process: 46.84 GiB mapped, nothing loaded` versus
+  `loaded 46.84 GiB at 1.42 GiB/s`. A second server that starts while the first is still loading waits for it
+  rather than reading a half-written arena, and if the first one dies mid-load the second takes the load over.
+  Put the file somewhere else with `--shared-expert-arena /path/to/file`, or use a private arena per server with
+  `--shared-expert-arena ""`. If the shared file cannot be used - Docker's default `/dev/shm` is 64 MiB, the path
+  may be read-only, or the file may hold a different model's experts - the engine falls back to a private arena
+  and says why. Windows has no shared arena yet (each server keeps its own), and `--mmap-experts` does not use
+  one either.
+
+One trade-off, and the engine reports it either way: a shared arena is a file, and files are
+mapped with 4 KB pages. A PC that has a huge-page pool configured (`vm.nr_hugepages`) would otherwise get 2 MB
+pages for its experts, which is better for one server and worse for two. The startup line says which you got -
+`MAP_SHARED file /dev/shm/shared_experts.dat (pack hash checked)` or `hugetlb 2 MB pages` - and
+`--shared-expert-arena ""` asks for the private, huge-page arena on a single-server PC.
+
+This is per-machine, not per-model. Two servers of the **same** model share one arena; two servers of
+**different** models cannot, because the file records which model's experts it holds and refuses a mismatch - the
+second one falls back to a private arena and says so, which means that model's experts are in RAM twice. If you
+run two different models, give each its own file: `--shared-expert-arena /dev/shm/experts-iq2_xs.dat` and
+`.../experts-coder.dat`. Serving two requests at the same time from ONE server is a different thing: it is
+`--serve-slots N` (opt-in, off by default).
+
+---
+
 ## Sharing the GPU with other programs (optional)
 
 By default the model stays loaded until you close Strata. On a PC that also games, renders or runs another model
