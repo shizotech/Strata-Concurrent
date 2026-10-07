@@ -532,6 +532,110 @@ void test_host_memory() {
 #endif
 }
 
+// THE SHARED ARENA IS LOADED ONCE, NOT ONCE PER PROCESS.
+//
+// Two `strata --serve` processes on one PC used to read the same 46.84 GiB of experts into the same shared
+// file twice ("loaded 46.84 GiB at 0.09 GiB/s" for the second one), and a process that started while another
+// was still loading read a HALF-WRITTEN arena.  `PinnedArena` now decides the role under the backing file's
+// lock (core/pinned.cu), and `ArenaExpertSource` acts on it: an owner loads and publishes, a borrower loads
+// nothing.  This is the source-level half of that contract; the header protocol itself is covered by
+// src/core/pinned_shared_test.cpp, including the cross-process and dead-owner cases.
+//
+// It is a synthetic 6-blob canonical pack, so it costs ~10 MB and a second - and it needs no model, no server
+// and no GPU work beyond registering 10 MB.  The second half of the contract matters just as much: a shared
+// backing that CANNOT be used (Docker's 64 MiB /dev/shm, a read-only path, another model's file) must fall back
+// to a private arena rather than stop the start.  Parking an optimisation must never be an outage.
+void test_shared_arena_borrow() {
+    using namespace strata::core;
+    using namespace strata::kernels::cpu;
+    constexpr int64_t layers = 2;
+    constexpr int64_t experts = 3;
+    const uint64_t layer_bytes = (uint64_t) experts * BLOB;
+    const uint64_t total = (uint64_t) layers * layer_bytes;
+    TempDirectory dir;
+    create_pack(dir.path, total, {{0, 'a'}, {layer_bytes, 'z'}});
+
+    std::string err;
+    require(expert_layout_load(dir.path.string(), layers, experts, err), "could not load canonical layout");
+
+    // NOT /dev/shm: the real shared arena may be live there under the user's running servers, and a test must
+    // never claim or publish it.  The protocol is not tmpfs-specific.
+    const fs::path shared = dir.path / "shared-arena.dat";
+    ArenaExpertSource owner, borrower;
+    require(owner.open(dir.path.string(), layers, experts, 1, err, 0, shared.string()),
+            "the first source did not open: " + err);
+    require(!owner.borrowed(), "the first source must own the load, not borrow it");
+    require(owner.load_gib_per_second() > 0.0, "the owner reports the load it actually did");
+    const uint8_t* loaded = owner.blob(1, 0);
+    require(loaded != nullptr && loaded[0] == 'z', "the owner's arena holds the pack's bytes");
+
+    err.clear();
+    require(borrower.open(dir.path.string(), layers, experts, 1, err, 0, shared.string()),
+            "the second source did not open: " + err);
+    require(borrower.borrowed(), "the second source borrowed the arena instead of re-loading it");
+    require(borrower.load_gib_per_second() == 0.0, "a borrowed arena loaded nothing");
+    const uint8_t* borrowed = borrower.blob(1, 0);
+    require(borrowed != nullptr && borrowed[0] == 'z', "the borrowed arena holds the bytes the owner wrote");
+    borrower.close();
+    owner.close();
+
+    // A shared backing that cannot be reserved is a downgrade, not a failure: the process still starts, on a
+    // private arena it loads itself, and the note says why.
+    ArenaExpertSource fallback;
+    err.clear();
+    require(fallback.open(dir.path.string(), layers, experts, 1, err, 0, "/definitely/not/writable/arena.dat"),
+            "an unusable shared backing stopped the start instead of falling back: " + err);
+    require(!fallback.borrowed(), "the fallback arena is private, so this process loaded it");
+    require(fallback.note().find("refused") != std::string::npos, "the fallback is not reported in the note");
+    const uint8_t* fell_back = fallback.blob(1, 0);
+    require(fell_back != nullptr && fell_back[0] == 'z', "the fallback arena holds the pack's bytes");
+    fallback.close();
+
+    // An empty shared path is the documented way to ask for a private arena.
+    ArenaExpertSource private_arena;
+    err.clear();
+    require(private_arena.open(dir.path.string(), layers, experts, 1, err, 0, {}),
+            "a private arena did not open: " + err);
+    require(!private_arena.borrowed(), "a private arena is never borrowed");
+    private_arena.close();
+}
+
+// A shared file written for a DIFFERENT pack must not be read: the pack hash is what makes borrowing safe, and
+// the answer is the same fallback as any other unusable backing.  Runs last because it changes the process-wide
+// expert layout.
+void test_shared_arena_pack_mismatch() {
+    using namespace strata::core;
+    using namespace strata::kernels::cpu;
+    constexpr int64_t experts = 3;
+    TempDirectory dir;
+    std::string err;
+
+    // First pack: 2 layers, and it publishes the shared file.
+    const uint64_t first_total = 2 * (uint64_t) experts * BLOB;
+    create_pack(dir.path, first_total, {{0, 'a'}});
+    require(expert_layout_load(dir.path.string(), 2, experts, err), "could not load the first layout");
+    const fs::path shared = dir.path / "shared-mismatch.dat";
+    ArenaExpertSource first;
+    require(first.open(dir.path.string(), 2, experts, 1, err, 0, shared.string()), "the first pack did not open: " + err);
+    require(!first.borrowed(), "the first pack owns the arena");
+
+    // Second pack: 4 layers, so a different layout total and a different pack hash, same shared file.
+    const fs::path other = dir.path / "other";
+    fs::create_directories(other);
+    // The marker sits at the FIRST blob of the LAST layer: the first layer's offset is shared with the
+    // 2-layer pack's layout, so only a byte that far in proves the arena really is this pack's own.
+    create_pack(other, 4 * (uint64_t) experts * BLOB, {{3 * (uint64_t) experts * BLOB, 'q'}});
+    require(expert_layout_load(other.string(), 4, experts, err), "could not load the second layout");
+    ArenaExpertSource second;
+    require(second.open(other.string(), 4, experts, 1, err, 0, shared.string()),
+            "a mismatched pack over the same file stopped the start: " + err);
+    require(!second.borrowed(), "a mismatched pack must not borrow another pack's arena");
+    const uint8_t* own = second.blob(3, 0);
+    require(own != nullptr && own[0] == 'q', "the mismatched pack did not load its own experts");
+    second.close();
+    first.close();
+}
+
 // STRATA_IO_PREFETCH: the experts.bin file tier hands out the same bytes with the Linux I/O path on (whole-blob
 // preads, the read-ahead workers, the mapping for cached blobs), however the reads and the predictions interleave.
 void test_io_prefetch() {
@@ -697,11 +801,13 @@ int main(int argc, char** argv) {
 #if defined(STRATA_NATIVE_EXPERTS)
         test_native_variable_layout();
 #endif
+        test_shared_arena_borrow();
         if (argc == 2 && std::string(argv[1]) == "--rotation-gpu") {
             test_rotating_source(false, true);
             test_rotating_source(true, true);
             test_rotating_source(true, false);
         }
+        test_shared_arena_pack_mismatch();   // last: it leaves the process-wide layout on the second pack
         std::cout << "file_expert_source_test: PASS\n";
         return 0;
     } catch (const std::exception& error) {

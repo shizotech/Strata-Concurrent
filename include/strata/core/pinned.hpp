@@ -28,6 +28,40 @@ enum class PageBacking { LargePages, NormalPages, PinnedByCuda };
 /// -2 for "auto" (Windows: the sliced pin stays below the GPU's shared-memory budget).
 int arena_pin_cap_gib();
 
+// ================================ THE SHARED BACKING FILE: ITS ON-DISK PROTOCOL ================================
+//
+// A shared arena is a file whose first 4 KiB identify it and whose remaining bytes ARE the arena, mapped
+// MAP_SHARED by every process that uses it.  The header is the ONLY thing two processes use to agree on who
+// loads, so its layout is an ABI and not an implementation detail: `magic`, `version`, `header_bytes` and the
+// five fields that follow must never move, because an OLDER engine has to be able to read a newer file and
+// refuse it correctly rather than mis-parse it.  The protocol fields below therefore live in the header's
+// existing `reserved[]` slots rather than after it.
+//
+//   offset  0  char[16]  "STRATA-ARENA-V1"
+//   offset 16  u32       version (1)
+//   offset 20  u32       header_bytes (4096)
+//   offset 24  u64       arena_bytes
+//   offset 32  u64       pack_hash
+//   offset 40  u64       state   0 = the body is NOT populated, 1 = ready to borrow
+//   offset 48  u64       owner   pid owning the load, 0 = nobody owns it
+//   offset 56  u64       nonce   random per load attempt: what says WHO owns the load, not the pid
+//   offset 64  u64       owner_start  the owner's /proc start time, 0 = unknown (an old file)
+//
+// A v1 file written by an engine that had `reserved[4]` here has state/owner/nonce all ZERO, which is exactly
+// "not populated": it is loaded once by the first process that understands this protocol and published, never
+// trusted blindly.
+//
+// `owner_start` is what makes "the owner is gone" decidable rather than guessed.  A pid alone cannot say it: if
+// the loader was SIGKILLed and its pid was recycled, `/proc/<pid>` exists and a process that trusts the pid
+// alone stalls for the whole wait budget on a load that will never happen.  Comparing the recorded start time
+// against the live process's makes the take-over path exact.
+inline constexpr uint64_t kSharedArenaHeaderBytes = 4096;
+inline constexpr uint64_t kSharedArenaStateOffset = 40;
+inline constexpr uint64_t kSharedArenaOwnerOffset = 48;
+inline constexpr uint64_t kSharedArenaNonceOffset = 56;
+inline constexpr uint64_t kSharedArenaOwnerStartOffset = 64;
+inline constexpr uint64_t kSharedArenaReady = 1;
+
 struct PinnedArena {
     void* base = nullptr;
     uint64_t capacity = 0;
@@ -49,7 +83,22 @@ struct PinnedArena {
     /// `shared_file`: on Linux, use a file-backed MAP_SHARED mapping instead of anonymous memory.
     /// `shared_pack_hash` identifies the pack that is allowed to populate that backing.  The file carries a
     /// small header and is refused when its stored hash does not match.  Empty `shared_file` preserves the
-    /// existing allocation path.  Population/coordination and backing-file lifetime remain the caller's job.
+    /// existing allocation path.
+    ///
+    /// THE ARENA IS NOW POPULATED EXACTLY ONCE, not once per process.  The constructor decides the role under an
+    /// exclusive `flock` on the backing file and records it in the header (see the protocol above), so the caller
+    /// never has to guess:
+    ///
+    ///   * `shared_load_owner == true`  - this process owns the load.  The body is NOT populated yet: the caller
+    ///     must write the arena's bytes and then call `publish_shared_load()`.  Until it does, every other
+    ///     process treats the file as not ready and will not read it.
+    ///   * `shared_load_owner == false` and `shared_borrowed == true` - the bytes are already there and correct
+    ///     for `shared_pack_hash`: the caller must load NOTHING.
+    ///   * `shared_load_owner == false` and `shared_borrowed == false` - not a shared backing at all (or the
+    ///     reservation failed); `shared_*` are otherwise untouched.
+    ///
+    /// A process that finds the file owned by a live loader WAITS for it (bounded, see `note`) instead of either
+    /// re-loading it or reading it half-written; a process that finds the owner gone takes the load over.
     PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t max_pinned_bytes = 0,
                 const std::string& shared_file = {}, uint64_t shared_pack_hash = 0);
     /// #285: reserve only; the caller registers the slices with register_slices(), on a thread, while its readers
@@ -63,12 +112,32 @@ struct PinnedArena {
     std::vector<uint64_t> slice_starts;
     void* mapping_base = nullptr;     ///< actual mapping start; differs from base when a shared-file header exists
     uint64_t mapping_bytes = 0;       ///< bytes to release from mapping_base
+
+    /// What the shared backing actually did, for the startup print.  Only meaningful when `valid()` and the
+    /// reservation used a `shared_file`.
+    bool shared_borrowed = false;     ///< the arena body was already populated by another process: load nothing
+    bool shared_load_owner = false;   ///< this process must populate the body and then publish it
+    uint64_t shared_pack_hash = 0;    ///< the pack hash this arena was reserved for / borrowed under
+    uint64_t shared_load_nonce = 0;   ///< identifies THIS process's load attempt in the header
+    uint32_t shared_owner_pid = 0;    ///< header's owner pid when the arena was reserved
+    uint32_t shared_waited_ms = 0;    ///< how long a borrower waited for someone else's load
+
+    /// Publish a shared arena this process loaded: release-fence the body writes, then store `state = ready` in
+    /// the header.  Returns false (and says why in `why`) when the arena is not a shared backing this process
+    /// owns, so a caller that forgot to load cannot mark somebody else's bytes as good.
+    bool publish_shared_load(std::string* why = nullptr);
     ~PinnedArena();
     PinnedArena(const PinnedArena&) = delete;
     PinnedArena& operator=(const PinnedArena&) = delete;
 
     bool valid() const { return base != nullptr; }
     uint8_t* data() const { return (uint8_t*) base; }
+
+  private:
+    /// The shared backing file, kept so `publish_shared_load()` can write the header's READY flag through the
+    /// file rather than through the mapping (the publish must be a single ordered store, not a page write that
+    /// another process can see half-done).  Empty for every other backing.
+    std::string shared_file_;
 };
 
 struct LoadStats {

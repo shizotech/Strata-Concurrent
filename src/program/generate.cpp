@@ -419,7 +419,16 @@ struct Options {
     bool no_host_worker = false;
     bool coupled_draft = strata::core::coupled_draft_env(); ///< Coupled draft sampling for MTP drafter under sampling
     bool mmap_experts = false;    ///< R2.1: opt OUT of the resident arena, back to MapViewOfFile
-    std::string shared_expert_arena; ///< Linux: optional file backing for the resident arena shared by processes
+    /// Linux: file backing for the resident arena, shared by the processes on the machine.  The first process to
+    /// claim it loads the experts; the rest map the same bytes (core/pinned.cu).  ON by default where it exists:
+    /// two servers on one PC should hold ONE copy of 47 GiB of experts, not two.  Empty on Windows, where the
+    /// shared backing is not implemented and a non-empty default would refuse every start.
+#ifdef _WIN32
+    std::string shared_expert_arena;
+#else
+    std::string shared_expert_arena = "/dev/shm/shared_experts.dat";
+#endif
+    bool shared_expert_arena_given = false;   ///< an explicit --shared-expert-arena is obeyed, a default is not
     bool resident_cpu_experts = false; ///< mmap-backed static-cache misses copied into ordinary RAM
     /// `--resident-experts` (the low-RAM PC's resident mode, chosen by setup): `--resident-cpu-experts` with the copy
     /// page-locked when the driver allows (else locked in the working set), 4 GiB of RAM headroom, and plain mmap
@@ -859,6 +868,9 @@ void usage() {
                  "  --shared-expert-arena FILE  Linux: back the resident arena with one MAP_SHARED file.\n"
                  "                       Put this file on /dev/shm, not ordinary SSD storage.\n"
                  "                       A small header binds an existing backing file to the same pack.\n"
+                 "                       The first process to claim the file loads the experts, every later one\n"
+                 "                       maps the same bytes instead of re-reading them.  Default\n"
+                 "                       /dev/shm/shared_experts.dat; pass \"\" for a private arena.\n"
                  "  --resident-cpu-experts  with mmap and a static profile, keep the experts the GPU cache does not\n"
                  "                       hold resident in ordinary RAM (and the prompt path's lend region as far as\n"
                  "                       RAM allows); adaptive swaps exchange them, so none is read from the file again.\n"
@@ -1846,7 +1858,7 @@ int main(int argc, char** argv) {
             o.expert_profile_save_min = std::atof(next("--expert-profile-save-every"));
         else if (a == "--gpu-stages") o.gpu_stages = true;
         else if (a == "--mmap-experts") o.mmap_experts = true;
-        else if (a == "--shared-expert-arena") o.shared_expert_arena = next("--shared-expert-arena");
+        else if (a == "--shared-expert-arena") { o.shared_expert_arena = next("--shared-expert-arena"); o.shared_expert_arena_given = true; }
         else if (a == "--resident-cpu-experts") o.resident_cpu_experts = o.resident_cpu_explicit = true;
         else if (a == "--resident-experts") {
             o.mmap_experts = o.resident_cpu_experts = o.resident_pin = o.resident_soft = true;
@@ -1970,8 +1982,20 @@ int main(int argc, char** argv) {
     bool multi_gpu = !split_devs.empty() && !split_same;   // cleared by --split-skip-if-fits before any stage loads
     bool split_own_auto = false;   // #340: the split keeps own prompt buffers by its rule (not --no-prefill-borrow)
     if (o.mmap_experts && !o.shared_expert_arena.empty()) {
-        std::fprintf(stderr, "strata generate: --shared-expert-arena backs the resident arena and cannot be used with --mmap-experts\n");
-        return 2;
+        // **THE SHARED ARENA BACKS THE RESIDENT ARENA, AND `--mmap-experts` HAS NONE.**  The mmap path reads the
+        // pack's `experts.bin` through the OS file cache instead of holding a copy in RAM - which is what the
+        // low-RAM mode does (`setup.py` passes `--resident-experts`, and that implies `--mmap-experts`).  Now
+        // that the shared backing is ON by default, treating the two as a contradiction would stop every
+        // low-RAM install from starting at all, over an option that simply does not apply to it.  So a DEFAULT
+        // shared arena is dropped with a note when there is no resident arena to share; an EXPLICIT one is still
+        // a contradiction the user should hear about.
+        if (o.shared_expert_arena_given) {
+            std::fprintf(stderr, "strata generate: --shared-expert-arena backs the resident arena and cannot be used with --mmap-experts\n");
+            return 2;
+        }
+        o.shared_expert_arena.clear();
+        std::fprintf(stderr, "strata generate: --mmap-experts has no resident arena to share: the default "
+                             "--shared-expert-arena is not used (--shared-expert-arena FILE names one explicitly)\n");
     }
     if (o.resident_cpu_experts && (!o.mmap_experts || o.expert_profile.empty())) {
         std::fprintf(stderr, "strata generate: --resident-cpu-experts requires --mmap-experts and a static --expert-profile\n");
@@ -4126,9 +4150,17 @@ int main(int argc, char** argv) {
         if (!arena_src.ram_warning().empty())   // #633: said before the load's numbers, which it explains
             std::fprintf(stderr, "strata generate: WARNING: %s\n", arena_src.ram_warning().c_str());
         std::fprintf(stderr, "strata generate: expert arena: %s\n", arena_src.note().c_str());
-        std::fprintf(stderr, "strata generate: loaded %.2f GiB at %.2f GiB/s\n",
-                     (double) strata::kernels::cpu::expert_layout().total / (1024.0 * 1024 * 1024),
-                     arena_src.load_gib_per_second());
+        // A BORROWED ARENA LOADED NOTHING, and `load_gib_per_second()` is 0.0 for it.  Printing the rate line
+        // anyway reads as "46.84 GiB at 0.00 GiB/s" - a catastrophic disk - when in fact the second server did
+        // the smart thing and mapped the bytes the first one already wrote.  Say which of the two happened.
+        if (arena_src.borrowed())
+            std::fprintf(stderr, "strata generate: expert arena borrowed from another process: %.2f GiB mapped, "
+                                 "nothing loaded\n",
+                         (double) strata::kernels::cpu::expert_layout().total / (1024.0 * 1024 * 1024));
+        else
+            std::fprintf(stderr, "strata generate: loaded %.2f GiB at %.2f GiB/s\n",
+                         (double) strata::kernels::cpu::expert_layout().total / (1024.0 * 1024 * 1024),
+                         arena_src.load_gib_per_second());
         // A rate under ~0.2 GiB/s is not the hardware.  Task Scheduler / service contexts throttle this
         // read+fill about 24x (measured 0.05 vs 1.42 GiB/s for the same binary, args and cache state; the
         // scheduler's defaults - Below normal priority and a least-privilege token - were the only

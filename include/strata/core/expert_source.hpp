@@ -793,6 +793,11 @@ public:
 
     bool mapped() const { return base_ != nullptr; }
     int64_t blobs() const { return blobs_; }
+    /// THE ARENA WAS BORROWED, NOT LOADED.  With `--shared-expert-arena` (Linux) the first process to claim the
+    /// backing file populates it and every later process maps the same bytes; `load_gib_per_second()` is then
+    /// 0.0 because nothing was read.  The driver prints the load rate, so it needs to be able to tell "instant"
+    /// from "failed" - and an arena whose bytes came from another process must never be re-read.
+    bool borrowed() const { return borrowed_; }
     const uint8_t* blob(int64_t layer, int64_t expert) override;
     int64_t reads() const { return reads_; }
     bool pinned(int64_t layer, int64_t expert) const override;
@@ -815,6 +820,7 @@ public:
 
 private:
     void* arena_ = nullptr;          ///< the PinnedArena, owned
+    bool borrowed_ = false;          ///< the shared arena was populated by another process: nothing was loaded
     void* map_ = nullptr;            ///< STRATA_ARENA_MMAP: the arena file, mapped read-only (not the PinnedArena)
     uint64_t map_bytes_ = 0;
     std::vector<const uint8_t*> dev_slice_;   ///< device alias of each registered slice (or of the whole range)

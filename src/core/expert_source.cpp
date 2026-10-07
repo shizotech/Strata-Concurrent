@@ -3771,9 +3771,9 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     // certain to end that way: refused, with the numbers.  Less RAM available than the arena (another program, an
     // engine still exiting) is only a warning - the OS may make room - per the recommend-not-force rule.
     ram_warning_.clear();
-    // (a shared arena, --shared-expert-arena, may already be in RAM for another engine: not checked)
-    if (detail::HostMemory hm; shared_arena_file.empty() && detail::host_available_memory(hm)) {
-        const uint64_t need = want + (uint64_t) blob;
+    // (a shared arena, --shared-expert-arena, may already be in RAM for another engine: not checked.  When that
+    // backing turns out to be unusable the arena is PRIVATE after all, so the check runs again there - see below.)
+    auto host_ram = [&](uint64_t need, detail::HostMemory& hm) -> bool {
         const double gib = 1073741824.0;
         char buf[512];
         if (hm.cgroup_limit < need) {
@@ -3794,7 +3794,10 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
                           (double) need / gib, (double) hm.available / gib, (double) (need - hm.available) / gib);
             ram_warning_ = buf;
         }
-    }
+        return true;
+    };
+    if (detail::HostMemory hm; shared_arena_file.empty() && detail::host_available_memory(hm))
+        if (!host_ram(want + (uint64_t) blob, hm)) return false;
 
     uint64_t pack_hash = 0;
     if (!shared_arena_file.empty() &&
@@ -3815,16 +3818,47 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     // Linux keeps the whole-arena pin (#253). OPT-IN (STRATA_DEFERRED_REGISTER=1): on the RTX 5070 / Windows the
     // arena registered per layer before it is filled decoded ~10% slower than the old order (whole-arena try, sliced
     // fallback after the load) with identical output; the start-time gain does not pay for that.
+    //
+    // `defer_wanted()` deliberately says nothing about the shared backing: that part is the CALLER's condition, and
+    // it has to be re-checked after the fallback below rather than frozen here.  A shared arena rules deferred out
+    // because it is populated ONCE for every process - a borrower has no per-layer load to pipeline a registration
+    // against, and a registration thread publishing `ready` beside one is a race with the publish protocol.  Once
+    // the backing fell back to a PRIVATE arena, a shared arena is no longer in play and the gate applies again.
+    auto defer_wanted = [&] {
 #ifdef _WIN32
-    const char* defer_env = std::getenv("STRATA_DEFERRED_REGISTER");
-    const bool deferred = max_pinned_bytes == 0 && arena_pin_cap_gib() == -1 && shared_arena_file.empty() &&
-                          (defer_env != nullptr && defer_env[0] != 0 && defer_env[0] != '0');
+        const char* defer_env = std::getenv("STRATA_DEFERRED_REGISTER");
+        return max_pinned_bytes == 0 && arena_pin_cap_gib() == -1 &&
+               defer_env != nullptr && defer_env[0] != 0 && defer_env[0] != '0';
 #else
-    const bool deferred = false;
+        return false;
 #endif
+    };
+    bool deferred = shared_arena_file.empty() && defer_wanted();
+    // THE SHARED BACKING IS AN OPTIMISATION, NOT A REQUIREMENT.  It is on by default on Linux, which means it
+    // must degrade gracefully everywhere it cannot work: Docker's default /dev/shm is 64 MiB (the arena is
+    // 47 GiB, so the free-space check refuses it before the load can SIGBUS), a container may mount it
+    // read-only, the path may not be writable, or the file may hold another model's arena (pack hash
+    // mismatch).  In every one of those the right answer is the private anonymous arena this code used
+    // before - slower to start, more RAM, but CORRECT - and a note that says which happened and why.  Refusing
+    // to start would turn a missing optimisation into an outage, and on a machine running several servers it
+    // would take the whole install down.
     PinnedArena* a = deferred ? new PinnedArena(want + (uint64_t) blob, bounds, PinnedArena::Deferred{})
                               : new PinnedArena(want + (uint64_t) blob, bounds, max_pinned_bytes,
                                                 shared_arena_file, pack_hash);
+    std::string shared_fallback;
+    if (!a->valid() && !shared_arena_file.empty()) {
+        shared_fallback = a->note;
+        delete a;
+        // The fallback arena is PRIVATE, so #633's RAM guard applies to it even though it was skipped for the
+        // shared backing above: this process is about to commit the whole arena itself.
+        if (detail::HostMemory hm; detail::host_available_memory(hm))
+            if (!host_ram(want + (uint64_t) blob, hm)) return false;
+        // ...and it is PRIVATE, so #285's deferred registration is available to it after all.  Re-evaluate the
+        // gate here instead of keeping the answer it gave for a backing this process is not using.
+        deferred = defer_wanted();
+        a = deferred ? new PinnedArena(want + (uint64_t) blob, bounds, PinnedArena::Deferred{})
+                     : new PinnedArena(want + (uint64_t) blob, bounds, max_pinned_bytes, {}, 0);
+    }
     if (!a->valid()) {
         const std::string why = a->note;
         delete a;
@@ -3833,25 +3867,51 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
               (why.empty() ? std::string{} : ": " + why);
         return false;
     }
+    // THE ARENA IS LOADED ONCE, NOT ONCE PER PROCESS.  `PinnedArena` decided the role under the backing file's
+    // lock: either this process owns the load, or the bytes are already there for this pack hash.  Re-reading
+    // 46.84 GiB that another process already put in the shared file is what made the second server take
+    // minutes ("loaded 46.84 GiB at 0.09 GiB/s" - it was WRITING the same tmpfs pages the first server had
+    // just written), and re-reading while another process is mid-load is not slow but WRONG: the arena would
+    // hold two interleaved copies of the experts.
+    //
+    // READ THE ROLE NOW, BEFORE ANYTHING ELSE TOUCHES IT.  `publish_shared_load()` clears `shared_load_owner`
+    // and sets `shared_borrowed` when it succeeds - correctly, for the arena: after publishing, its bytes ARE
+    // borrowable, by this process included.  But the caller's question is "did I load it?", and answering that
+    // from the post-publish flags would report the OWNER as a borrower and print "nothing loaded" for the one
+    // process that just spent a minute loading.  So the role is snapshotted here and used throughout.
+    const bool borrowed_arena = a->shared_borrowed;
+    const bool owns_the_load = a->shared_load_owner;
     // #285: unbuffered when the drive is read anyway and the file cache could not keep the experts for the next
-    // start either (a 64 GB PC); otherwise the buffered readers, which a warm restart serves from the cache
+    // start either (a 64 GB PC); otherwise the buffered readers, which a warm restart serves from the cache.
+    // A BORROWED ARENA READS NOTHING, so the probe is skipped with the load: it would time random reads of files
+    // this process is not going to open, and print a line about a read that never happened.
     std::vector<std::string> files;
-    if (from_gguf) {
-        for (int64_t l = 0; l < n_layers; ++l)
-            for (int r = 0; r < 3; ++r) {
-                const std::string f = expert_gguf_file(gguf_, lay, l, r);
-                if (std::find(files.begin(), files.end(), f) == files.end()) files.push_back(f);
-            }
-    } else {
-        files.push_back(path);
+    if (!borrowed_arena) {
+        if (from_gguf) {
+            for (int64_t l = 0; l < n_layers; ++l)
+                for (int r = 0; r < 3; ++r) {
+                    const std::string f = expert_gguf_file(gguf_, lay, l, r);
+                    if (std::find(files.begin(), files.end(), f) == files.end()) files.push_back(f);
+                }
+        } else {
+            files.push_back(path);
+        }
     }
     std::string why;
-    const bool unbuffered = experts_unbuffered(files, want + (uint64_t) blob, why);
+    const bool unbuffered = !borrowed_arena && experts_unbuffered(files, want + (uint64_t) blob, why);
     const int readers = unbuffered ? std::max(threads, 16) : threads;   // 16 keep a PCIe 5 drive's queue full
     LoadStats st;
+    // #285: the registration thread runs AHEAD of the readers, which wait for their own layer's slice.
+    // A BORROWED ARENA LOADS NOTHING, so it must start no readers AND no registration thread: there is no page
+    // being written whose slice has to be pinned first, and a thread registering slices of an arena nobody is
+    // filling would only add a `cudaHostRegister` storm to a start that reads nothing.  `deferred` and
+    // `borrowed_arena` cannot both be true - `deferred` only ever holds for an arena THIS process reserved (a
+    // private one, or a shared one it fell back to), while `borrowed_arena` means somebody else populated the
+    // bytes - so `if (deferred)` alone would already be enough.  The second half is spelled out because that
+    // invariant is not local to this function and the next reader should not have to prove it.
     std::atomic<int> ready{0};
     std::thread reg;
-    if (deferred) {
+    if (deferred && !borrowed_arena) {
         int dev = 0;
         cudaGetDevice(&dev);
         reg = std::thread([a, &ready, dev] {
@@ -3860,17 +3920,25 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         });
     }
     const std::atomic<int>* rp = deferred ? &ready : nullptr;
-    if (from_gguf) {
-        st = load_experts_gguf(gguf_, a->data(), lay, readers, unbuffered, rp);
+    if (borrowed_arena) {
+        st.layers = (uint64_t) n_layers;
+        st.bytes = want;
+        st.seconds = 0.0;
     } else {
-        if (unbuffered) st = load_experts_direct(path, a->data(), loff, lbytes, readers, /*chunk=*/8u << 20, rp);
-        if (!unbuffered || (!st.ok && st.error.empty()))   // unaligned ranges: the buffered reader
-            st = load_experts_ranges(path, a->data(), loff, lbytes, threads, /*chunk=*/8u << 20, rp);
+        if (from_gguf) {
+            st = load_experts_gguf(gguf_, a->data(), lay, readers, unbuffered, rp);
+        } else {
+            if (unbuffered) st = load_experts_direct(path, a->data(), loff, lbytes, readers, /*chunk=*/8u << 20, rp);
+            if (!unbuffered || (!st.ok && st.error.empty()))   // unaligned ranges: the buffered reader
+                st = load_experts_ranges(path, a->data(), loff, lbytes, threads, /*chunk=*/8u << 20, rp);
+        }
+        std::fprintf(stderr, "strata generate: expert arena read %s (%s)\n",
+                     unbuffered ? "unbuffered" : "through the file cache", why.c_str());
     }
     if (reg.joinable()) reg.join();
-    std::fprintf(stderr, "strata generate: expert arena read %s (%s)\n", unbuffered ? "unbuffered" : "through the file cache",
-                 why.c_str());
     if (!st.ok) {
+        // `delete` releases this process's claim on the shared header, so the next process does not sit and
+        // wait for a load that just failed.
         delete a;
         err = "ArenaExpertSource: the expert load was refused: " + (st.error.empty() ? std::string("unknown") : st.error);
         return false;
@@ -3879,6 +3947,19 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         delete a;
         err = "ArenaExpertSource: the load read " + std::to_string(st.bytes) + " B of " + std::to_string(want);
         return false;
+    }
+    // Publish only AFTER the whole body is in place: this is the store that tells every other process the
+    // arena may be read.  A failure here is fatal rather than a warning - an arena that cannot announce itself
+    // is an arena whose contents nobody can trust.  It runs BEFORE the checksum print so a borrower is never
+    // left waiting on a diagnostic that walks 46 GiB of the arena.
+    if (owns_the_load) {
+        std::string publish_why;
+        if (!a->publish_shared_load(&publish_why)) {
+            delete a;
+            err = "ArenaExpertSource: the shared expert arena could not be published: " +
+                  (publish_why.empty() ? std::string("unknown") : publish_why);
+            return false;
+        }
     }
     if (std::getenv("STRATA_VERIFY_ARENA") != nullptr) {   // tests: the loaded arena's checksum, any loader
         std::fprintf(stderr, "strata generate: expert arena checksum %016llx (%.2f GiB)\n",
@@ -3930,6 +4011,10 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     n_expert_ = n_expert;
     reads_ = 0;
     note_ = a->note;
+    if (!shared_fallback.empty())
+        note_ = "shared arena " + shared_arena_file + " refused (" + shared_fallback +
+                "); using a private arena for this process" + (note_.empty() ? std::string{} : "; " + note_);
+    borrowed_ = borrowed_arena;
     gib_per_s_ = st.gib_per_second();
     load_seconds_ = st.seconds;
     load_read_s_ = st.read_seconds;
@@ -3952,6 +4037,7 @@ void ArenaExpertSource::close() {
     base_ = nullptr;
     blobs_ = 0;
     n_expert_ = 0;
+    borrowed_ = false;
 }
 
 void ArenaExpertSource::prefetch(int64_t layer, int64_t expert) {
